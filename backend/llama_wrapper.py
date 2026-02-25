@@ -138,7 +138,13 @@ class LlamaWrapper:
         
         print(f"🚀 [LlamaWrapper #{self.instance_id}] Starting server: {' '.join(cmd)}")
         
-        # Start server process
+        # Start server process with Metal/GPU env vars
+        import os
+        gpu_env = {
+            **os.environ,
+            'LLAMA_METAL': '1',          # Enable Metal backend
+            'GGML_METAL_FULL_OFFLOAD': '1',  # Offload all layers to GPU
+        }
         try:
             self.server_process = subprocess.Popen(
                 cmd,
@@ -146,7 +152,8 @@ class LlamaWrapper:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                env=gpu_env
             )
         except Exception as e:
             print(f"❌ [LlamaWrapper #{self.instance_id}] Failed to start server: {e}")
@@ -276,7 +283,7 @@ class LlamaWrapper:
                 "temperature": temperature
             }
 
-            response = requests.post(url, json=payload, stream=True, timeout=120)
+            response = requests.post(url, json=payload, stream=True, timeout=300)
             response.raise_for_status()
 
             full_response = ""

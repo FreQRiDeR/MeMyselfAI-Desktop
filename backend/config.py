@@ -29,7 +29,8 @@ class Config:
         "save_conversations": True,
         "theme": "system",  # system, light, dark
         "font_family": "SF Pro",  # Chat font family
-        "font_size": 13  # Chat font size
+        "font_size": 13,  # Chat font size
+        "inference_timeout": 300  # Seconds to wait for model response (all backends)
     }
     
     def __init__(self, config_file: str = "config.json"):

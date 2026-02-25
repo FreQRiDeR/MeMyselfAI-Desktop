@@ -372,6 +372,50 @@ class SettingsDialog(QDialog):
         """)
         self.threads_input.setRange(1, 16)
         params_layout.addRow("Threads:", self.threads_input)
+
+        self.timeout_input = QSpinBox()
+        self.timeout_input.setStyleSheet("""
+            QSpinBox {
+                background: #2C2C2E; 
+                color: #EBEBF5;
+                border: 1px solid #3A3A3C; 
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 12px;
+            }
+            QSpinBox:focus {
+                border-color: #e009a7;
+            }
+            QSpinBox::up-button {
+                border: none;
+                background: #3A3A3C;
+                width: 16px;
+            }
+            QSpinBox::up-button:hover { background: #48484A; border-left: 1px solid #e009a7; }
+            QSpinBox::down-button {
+                border: none;
+                background: #3A3A3C;
+                width: 16px;
+            }
+            QSpinBox::down-button:hover { background: #48484A; border-left: 1px solid #e009a7; }
+            QSpinBox::up-arrow {
+                width: 8px; height: 5px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 5px solid #e009a7;
+            }
+            QSpinBox::down-arrow {
+                width: 8px; height: 5px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #e009a7;
+            }
+        """)
+        self.timeout_input.setRange(30, 3600)
+        self.timeout_input.setSingleStep(30)
+        self.timeout_input.setSuffix(" s")
+        self.timeout_input.setToolTip("Max seconds to wait for a response from any backend (Ollama, llama-server, HuggingFace)")
+        params_layout.addRow("Inference Timeout:", self.timeout_input)
         
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
@@ -495,6 +539,7 @@ class SettingsDialog(QDialog):
         self.temperature_input.setValue(self.config.get("temperature", 0.7))
         self.context_size_input.setValue(self.config.get("context_size", 2048))
         self.threads_input.setValue(self.config.get("threads", 4))
+        self.timeout_input.setValue(self.config.get("inference_timeout", 300))
         
         # Appearance
         font_family = self.config.get("font_family", "SF Pro")
@@ -619,6 +664,7 @@ class SettingsDialog(QDialog):
         self.config.set("temperature", self.temperature_input.value())
         self.config.set("context_size", self.context_size_input.value())
         self.config.set("threads", self.threads_input.value())
+        self.config.set("inference_timeout", self.timeout_input.value())
         self.config.set("font_family", self.font_family_input.currentFont().family())
         self.config.set("font_size", self.font_size_input.value())
         
