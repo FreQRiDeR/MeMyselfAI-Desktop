@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MeMyselfAI
+Comment=Local AI chat desktop app
+Exec=memyselfai %U
+Icon=memyselfai
+Terminal=false
+Categories=Utility;Network;Chat;
+StartupNotify=true
+StartupWMClass=MeMyselfAI
