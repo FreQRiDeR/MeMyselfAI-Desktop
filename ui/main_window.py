@@ -27,7 +27,7 @@ from backend.system_prompts import SystemPromptManager
 # ─────────────────────────────────────────────
 class GenerationThread(QThread):
     token_generated     = pyqtSignal(str)
-    generation_complete = pyqtSignal()
+    generation_complete = pyqtSignal(dict)
     generation_error    = pyqtSignal(str)
 
     def __init__(self, backend, model, prompt, max_tokens, temperature, system_prompt="", messages=None):
@@ -50,7 +50,10 @@ class GenerationThread(QThread):
                 messages=self.messages
             ):
                 self.token_generated.emit(token)
-            self.generation_complete.emit()
+            stats = {}
+            if hasattr(self.backend, "get_last_generation_stats"):
+                stats = self.backend.get_last_generation_stats() or {}
+            self.generation_complete.emit(stats)
         except Exception as e:
             self.generation_error.emit(str(e))
 
@@ -72,6 +75,7 @@ class MainWindow(QMainWindow):
         self.current_conversation = None
         self._current_response  = ""
         self._history_open      = False
+        self._backend_signature = None
         self.prompt_manager     = SystemPromptManager()
         self.attached_files     = []  # List of file paths attached to next message
 
@@ -557,9 +561,66 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Font size: {new_size} pt")
 
     # ─── Configuration ────────────────────────
+    def _local_backend_kwargs(self, llama_path):
+        return {
+            "llama_cpp_path": llama_path,
+            "context_size": self.config.get("context_size", 2048),
+            "threads": self.config.get("threads", 4),
+            "inference_timeout": self.config.get("inference_timeout", 300),
+            "llama_gpu_layers": self.config.get("llama_gpu_layers", "auto"),
+            "llama_batch_size": self.config.get("llama_batch_size", 2048),
+            "llama_ubatch_size": self.config.get("llama_ubatch_size", 512),
+            "llama_threads_batch": self.config.get("llama_threads_batch", 0),
+            "llama_flash_attn": self.config.get("llama_flash_attn", "auto"),
+            "llama_kv_offload": self.config.get("llama_kv_offload", True),
+            "llama_mmap": self.config.get("llama_mmap", True),
+            "llama_mlock": self.config.get("llama_mlock", False),
+            "llama_numa": self.config.get("llama_numa", "disabled"),
+            "llama_priority": self.config.get("llama_priority", 0),
+            "llama_poll": self.config.get("llama_poll", 50),
+            "llama_extra_args": self.config.get("llama_extra_args", ""),
+        }
+
+    def _backend_config_signature(self, backend_type_str):
+        if backend_type_str == "local":
+            return (
+                "local",
+                self.config.get("llama_cpp_path", ""),
+                self.config.get("context_size", 2048),
+                self.config.get("threads", 4),
+                self.config.get("inference_timeout", 300),
+                self.config.get("llama_gpu_layers", "auto"),
+                self.config.get("llama_batch_size", 2048),
+                self.config.get("llama_ubatch_size", 512),
+                self.config.get("llama_threads_batch", 0),
+                self.config.get("llama_flash_attn", "auto"),
+                self.config.get("llama_kv_offload", True),
+                self.config.get("llama_mmap", True),
+                self.config.get("llama_mlock", False),
+                self.config.get("llama_numa", "disabled"),
+                self.config.get("llama_priority", 0),
+                self.config.get("llama_poll", 50),
+                self.config.get("llama_extra_args", ""),
+            )
+        if backend_type_str == "ollama":
+            return (
+                "ollama",
+                self.config.get("ollama_url", "http://localhost:11434"),
+                self.config.get("ollama_path", "bundled"),
+                self.config.get("inference_timeout", 300),
+            )
+        if backend_type_str == "huggingface":
+            return (
+                "huggingface",
+                self.config.get("hf_api_key", ""),
+                self.config.get("inference_timeout", 300),
+            )
+        return ("unknown",)
+
     def load_configuration(self):
         """Load configuration and initialize backend appropriately"""
         backend_type_str = self.config.get("backend_type", "local")
+        target_signature = self._backend_config_signature(backend_type_str)
 
         if not self.config.is_configured():
             self.status_bar.showMessage("⚠️  Please configure backend in Settings")
@@ -586,6 +647,9 @@ class MainWindow(QMainWindow):
             if current_type != target_type:
                 backend_needs_update = True
                 print("🔧 Backend type changed, recreating")
+            elif self._backend_signature != target_signature:
+                backend_needs_update = True
+                print("🔧 Backend settings changed, recreating")
                 
         if backend_needs_update:
             try:
@@ -600,27 +664,40 @@ class MainWindow(QMainWindow):
                     
                 if backend_type_str == "local":
                     llama_path = self.config.get_llama_cpp_path()
-                    self.backend = UnifiedBackend(BackendType.LOCAL, llama_cpp_path=llama_path)
+                    self.backend = UnifiedBackend(BackendType.LOCAL, **self._local_backend_kwargs(llama_path))
                     self.status_bar.showMessage(f"✅ Local backend: {llama_path}")
                     self.refresh_models()
 
                 elif backend_type_str == "ollama":
                     ollama_url = self.config.get("ollama_url", "http://localhost:11434")
-                    self.backend = UnifiedBackend(BackendType.OLLAMA, ollama_url=ollama_url)
+                    ollama_path = self.config.get("ollama_path", "bundled")
+                    self.backend = UnifiedBackend(
+                        BackendType.OLLAMA,
+                        ollama_url=ollama_url,
+                        ollama_path=ollama_path,
+                        inference_timeout=self.config.get("inference_timeout", 300),
+                    )
                     self.status_bar.showMessage(f"✅ Ollama backend: {ollama_url}")
                     self.refresh_ollama_models()
 
                 elif backend_type_str == "huggingface":
                     api_key = self.config.get("hf_api_key", "")
-                    self.backend = UnifiedBackend(BackendType.HUGGINGFACE, api_key=api_key)
+                    self.backend = UnifiedBackend(
+                        BackendType.HUGGINGFACE,
+                        api_key=api_key,
+                        inference_timeout=self.config.get("inference_timeout", 300),
+                    )
                     self.status_bar.showMessage("✅ HuggingFace backend configured")
                     self.model_combo.clear()
                     self.model_combo.addItem("Enter model name (e.g. meta-llama/Llama-2-7b-chat-hf)")
+
+                self._backend_signature = target_signature
 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to initialize backend:\n{e}")
         else:
             print("🔄 Reusing existing backend instance")
+            self._backend_signature = target_signature
             # Just refresh UI elements
             if backend_type_str == "local":
                 llama_path = self.config.get_llama_cpp_path()
@@ -803,9 +880,19 @@ class MainWindow(QMainWindow):
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
-    def on_generation_complete(self):
+    def on_generation_complete(self, stats: dict):
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        prompt_tps = stats.get("prompt_tps")
+        generation_tps = stats.get("generation_tps")
+        if prompt_tps is not None and generation_tps is not None:
+            cursor.insertText("\n")
+            # Keep default font family/size; only colorize.
+            cursor.insertHtml(
+                f'<span style="color:#8B5CF6;">'
+                f'[ Prompt: {prompt_tps:.1f} t/s | Generation: {generation_tps:.1f} t/s ]'
+                f'</span>'
+            )
         cursor.insertText("\n")
         self.chat_display.setTextCursor(cursor)
 

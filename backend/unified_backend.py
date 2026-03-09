@@ -36,13 +36,14 @@ class UnifiedBackend:
         """
         self.backend_type = backend_type
         self.config = config
+        self.inference_timeout = int(config.get('inference_timeout', 300))
         self.ollama_process = None  # To track Ollama process
         
         # Initialize backend-specific components
         if backend_type == BackendType.LOCAL:
             from backend.llama_wrapper import LlamaWrapper
             llama_path = config.get('llama_cpp_path', 'bundled')
-            self.local_wrapper = LlamaWrapper(llama_path)
+            self.local_wrapper = LlamaWrapper(llama_path, tuning=config)
         elif backend_type == BackendType.OLLAMA:
             self.ollama_url = config.get('ollama_url', 'http://localhost:11434')
             self.ollama_path = config.get('ollama_path', 'bundled')
@@ -87,7 +88,6 @@ class UnifiedBackend:
             possible_paths = [
                 Path(bundle_dir) / 'backend' / 'bin' / 'ollama',
                 Path(bundle_dir) / 'ollama',
-                Path(bundle_dir) / '../Frameworks/ollama/ollama',
             ]
         else:
             # Development mode
@@ -173,7 +173,7 @@ class UnifiedBackend:
                     }
                 },
                 stream=True,
-                timeout=60
+                timeout=self.inference_timeout
             )
             response.raise_for_status()
 
@@ -221,7 +221,7 @@ class UnifiedBackend:
                     }
                 },
                 stream=True,
-                timeout=60
+                timeout=self.inference_timeout
             )
             response.raise_for_status()
             
@@ -274,6 +274,13 @@ class UnifiedBackend:
                             
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"HuggingFace API error: {e}")
+
+    def get_last_generation_stats(self) -> dict:
+        """Return stats from the last generation if backend provides them."""
+        if self.backend_type == BackendType.LOCAL and hasattr(self, "local_wrapper"):
+            if hasattr(self.local_wrapper, "get_last_generation_stats"):
+                return self.local_wrapper.get_last_generation_stats()
+        return {}
     
     def stop_generation(self):
         """Stop current generation"""

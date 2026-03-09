@@ -3,6 +3,7 @@
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -95,19 +96,50 @@ if Path(ollama_binary_path).exists():
 else:
     print(f"⚠️  WARNING: ollama not found at: {ollama_binary_path}")
 
+# Collect networking deps used by requests, including optional charset/chardet backends.
+extra_datas = []
+extra_binaries = []
+extra_hiddenimports = []
+for pkg_name in (
+    'requests',
+    'urllib3',
+    'idna',
+    'certifi',
+    'charset_normalizer',
+    'chardet',
+):
+    try:
+        d, b, h = collect_all(pkg_name)
+        extra_datas.extend(d)
+        extra_binaries.extend(b)
+        extra_hiddenimports.extend(h)
+    except Exception as exc:
+        print(f"⚠️  WARNING: collect_all({pkg_name}) failed: {exc}")
+
+try:
+    extra_hiddenimports.extend(collect_submodules('charset_normalizer'))
+except Exception as exc:
+    print(f"⚠️  WARNING: collect_submodules(charset_normalizer) failed: {exc}")
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=binaries,
-    datas=backend_files + ui_files + data_files,
-    hiddenimports=[
+    binaries=binaries + extra_binaries,
+    datas=backend_files + ui_files + data_files + extra_datas,
+    hiddenimports=list(dict.fromkeys([
         'PyQt6',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',
         'PyQt6.sip',
-    ],
+        'chardet',
+        'charset_normalizer',
+        'charset_normalizer.api',
+        'charset_normalizer.md',
+        'charset_normalizer.cd',
+        'requests',
+    ] + extra_hiddenimports)),
     hookspath=[],
     hooksconfig={
         'PyQt6': {

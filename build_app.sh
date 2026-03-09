@@ -7,15 +7,19 @@ echo "🔨 Building MeMyselfAI.app with PyInstaller"
 echo "============================================"
 echo ""
 
-# Check if PyInstaller is installed
-if ! command -v pyinstaller &> /dev/null; then
-    echo "📦 Installing PyInstaller..."
-    pip3 install pyinstaller
+USE_UV=0
+if command -v uv &> /dev/null; then
+    USE_UV=1
 fi
 
-# Make sure PyQt6 is installed
-echo "📦 Checking PyQt6..."
-pip3 install PyQt6 --upgrade
+if [ "$USE_UV" -eq 1 ]; then
+    echo "📦 Syncing dependencies with uv..."
+    uv sync
+else
+    # Fallback to pip environment if uv is unavailable.
+    echo "📦 Installing dependencies with pip..."
+    pip3 install -r requirements.txt
+fi
 
 # Clean previous builds
 echo "🧹 Cleaning previous builds..."
@@ -23,7 +27,11 @@ rm -rf build dist
 
 # Build the app
 echo "🔨 Building application..."
-pyinstaller MeMyselfAI.spec --clean --noconfirm
+if [ "$USE_UV" -eq 1 ]; then
+    uv run pyinstaller MeMyselfAI.spec --clean --noconfirm
+else
+    pyinstaller MeMyselfAI.spec --clean --noconfirm
+fi
 
 # Check if build was successful
 if [ -d "dist/MeMyselfAI.app" ]; then
@@ -31,11 +39,17 @@ if [ -d "dist/MeMyselfAI.app" ]; then
     echo "✅ Build successful!"
     echo ""
     
-    # Verify llama-simple-chat is bundled
-    if [ -f "dist/MeMyselfAI.app/Contents/MacOS/llama/llama-simple-chat" ]; then
-        echo "✅ llama-simple-chat is bundled"
+    # Verify bundled binaries
+    if [ -f "dist/MeMyselfAI.app/Contents/Frameworks/backend/bin/llama-server" ]; then
+        echo "✅ llama-server is bundled"
     else
-        echo "⚠️  WARNING: llama-simple-chat NOT found in bundle!"
+        echo "⚠️  WARNING: llama-server NOT found in bundle!"
+    fi
+
+    if [ -f "dist/MeMyselfAI.app/Contents/Frameworks/backend/bin/ollama" ]; then
+        echo "✅ ollama is bundled"
+    else
+        echo "⚠️  WARNING: ollama NOT found in bundle!"
     fi
     
     echo ""

@@ -26,6 +26,19 @@ class Config:
         "temperature": 0.7,
         "context_size": 2048,
         "threads": 4,
+        # llama.cpp local backend tuning
+        "llama_gpu_layers": "auto",      # -ngl (auto|all|N)
+        "llama_batch_size": 2048,         # -b
+        "llama_ubatch_size": 512,         # -ub
+        "llama_threads_batch": 0,         # -tb (0 => follow --threads)
+        "llama_flash_attn": "auto",      # -fa (auto|on|off)
+        "llama_kv_offload": True,         # -kvo / -nkvo
+        "llama_mmap": True,               # --mmap / --no-mmap
+        "llama_mlock": False,             # --mlock
+        "llama_numa": "disabled",        # --numa distribute|isolate|numactl
+        "llama_priority": 0,              # --prio (-1..3)
+        "llama_poll": 50,                 # --poll (0..100)
+        "llama_extra_args": "",          # appended raw flags
         "save_conversations": True,
         "theme": "system",  # system, light, dark
         "font_family": "SF Pro",  # Chat font family
@@ -124,7 +137,7 @@ if __name__ == "__main__":
     config = Config("test_config.json")
     print("Config:", config.config)
     
-    config.set("llama_cpp_path", "/usr/local/bin/llama-server")
+    config.set("llama_cpp_path", "backend/bin/llama-server")
     print("Updated config:", config.config)
     
     # Cleanup
