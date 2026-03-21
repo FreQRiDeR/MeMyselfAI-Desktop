@@ -11,6 +11,7 @@ import time
 from enum import Enum
 from typing import Generator, Optional, Callable
 from pathlib import Path
+from backend.process_utils import background_process_kwargs
 
 
 class BackendType(Enum):
@@ -127,7 +128,8 @@ class UnifiedBackend:
                     self.ollama_process = subprocess.Popen(
                         [str(ollama_binary), 'serve'],
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
+                        stderr=subprocess.DEVNULL,
+                        **background_process_kwargs(),
                     )
                     # Wait up to 10s for Ollama to be ready instead of blind sleep
                     for _ in range(20):
@@ -146,12 +148,15 @@ class UnifiedBackend:
             bundle_dir = sys._MEIPASS
             possible_paths = [
                 Path(bundle_dir) / 'backend' / 'bin' / 'ollama',
+                Path(bundle_dir) / 'backend' / 'bin' / 'linux' / 'ollama',
                 Path(bundle_dir) / 'ollama',
             ]
         else:
             # Development mode
             possible_paths = [
                 Path(__file__).parent / 'bin' / 'ollama',
+                Path(__file__).parent / 'bin' / 'linux' / 'ollama',
+                Path('./backend/bin/linux/ollama'),
                 Path('./backend/bin/ollama'),
                 Path('./ollama'),
             ]

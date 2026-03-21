@@ -34,22 +34,29 @@ for icon_candidate in ("MeMyselfAi.png", "./MeMyselfAi.png"):
         data_files.append((str(icon_obj), "."))
         break
 
-# Bundle binaries from backend/bin/linux.
+# Bundle the static llama-server binary from backend/bin/linux.
 binaries = []
 
 backend_bin_dir = Path("backend/bin/linux")
-if not backend_bin_linux
--dir.exists():
+if not backend_bin_dir.exists():
     raise SystemExit("Missing backend/bin/linux directory; cannot bundle backend binaries.")
 
-backend_bin_files = sorted(p for p in backend_bin_dir.iterdir() if p.is_file())
-if not backend_bin_files:
-    raise SystemExit("backend/bin is empty; cannot bundle backend binaries.")
+llama_server_path = backend_bin_dir / "llama-server"
+if not llama_server_path.is_file():
+    raise SystemExit("Missing backend/bin/linux/llama-server; cannot bundle backend binary.")
 
-for src in backend_bin_files:
-    # Put EVERYTHING under backend/bin/linux so llama-server and its .so deps are co-located.
-    binaries.append((str(src), "backend/bin/linux"))
-    print(f"✅ Found {src.name} at: {src}")
+# Bundle Ollama binary if present.
+ollama_path = backend_bin_dir / "ollama"
+if not ollama_path.is_file():
+    raise SystemExit("Missing backend/bin/linux/ollama; cannot bundle backend binary.")
+
+# Static build: only ship llama-server (no .so dependencies expected).
+binaries.append((str(llama_server_path), "backend/bin/linux"))
+print(f"✅ Found llama-server at: {llama_server_path}")
+
+# Ship Ollama alongside llama-server.
+binaries.append((str(ollama_path), "backend/bin/linux"))
+print(f"✅ Found ollama at: {ollama_path}")
 
 a = Analysis(
     ["main.py"],

@@ -460,15 +460,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Clean up when closing the application"""
         # Stop any in-flight generation first so the process isn't mid-use during cleanup
-        if self.generation_thread and self.generation_thread.isRunning():
-            print("🛑 Stopping generation thread...")
-            if self.backend:
-                try:
-                    self.backend.stop_generation()
-                except Exception:
-                    pass
-            self.generation_thread.quit()
-            self.generation_thread.wait(3000)  # 3s timeout
+        self._stop_active_generation(reason="app close")
 
         if self.backend:
             try:
@@ -659,6 +651,7 @@ class MainWindow(QMainWindow):
             try:
                 # Clean up old backend if it exists
                 if self.backend is not None:
+                    self._stop_active_generation(reason="backend switch")
                     print("🧹 Cleaning up old backend")
                     try:
                         self.backend.cleanup()
@@ -820,8 +813,7 @@ class MainWindow(QMainWindow):
                     and self.backend
                     and getattr(self.backend, "backend_type", None) == BackendType.LOCAL
                 ):
-                    if self.generation_thread and self.generation_thread.isRunning():
-                        self.backend.stop_generation()
+                    self._stop_active_generation(reason="model switch")
                     self.status_bar.showMessage("Switching model… warming up")
                     self.backend.preload_model(self.current_model)
                 self.status_bar.showMessage(f"Selected: {self.model_combo.currentText()}")
@@ -1079,15 +1071,28 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Error occurred")
 
     def stop_generation(self):
-        if self.backend:
-            self.backend.stop_generation()
-        if self.generation_thread:
-            self.generation_thread.quit()
-            self.generation_thread.wait()
+        self._stop_active_generation(reason="user stop")
         self.message_input.setEnabled(True)
         self.send_button.setVisible(True)
         self.stop_button.setVisible(False)
         self.status_bar.showMessage("Generation stopped")
+
+    def _stop_active_generation(self, reason: str = ""):
+        """Best-effort stop of any running generation thread and backend process."""
+        if self.generation_thread and self.generation_thread.isRunning():
+            label = f" ({reason})" if reason else ""
+            print(f"🛑 Stopping generation thread{label}...")
+            if self.backend:
+                try:
+                    self.backend.stop_generation()
+                except Exception:
+                    pass
+            self.generation_thread.quit()
+            self.generation_thread.wait(3000)
+            if self.generation_thread.isRunning():
+                print("⚠️  Generation thread did not stop; terminating")
+                self.generation_thread.terminate()
+                self.generation_thread.wait(1000)
 
     def append_message(self, sender: str, message: str, color: str):
         cursor = self.chat_display.textCursor()

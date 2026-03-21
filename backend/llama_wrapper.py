@@ -12,8 +12,10 @@ import time
 import requests
 import threading
 import os
+import signal
 from pathlib import Path
 from typing import Optional, Callable, Generator
+from backend.process_utils import background_process_kwargs
 
 
 class LlamaWrapper:
@@ -94,6 +96,7 @@ class LlamaWrapper:
                 possible_server_paths = [
                     cli_path.parent / 'llama-server',
                     Path('backend/bin/llama-server'),
+                    Path('backend/bin/linux/llama-server'),
                     Path('./llama-server'),
                 ]
                 for path in possible_server_paths:
@@ -108,9 +111,19 @@ class LlamaWrapper:
             if hasattr(sys, '_MEIPASS'):
                 # Try multiple possible locations
                 bundle_dir = sys._MEIPASS
-                possible_paths = [
-                    # Current spec bundles binaries under backend/bin in Frameworks/_internal.
+                possible_paths = []
+
+                if sys.platform == 'win32':
+                    possible_paths.extend([
+                        Path(bundle_dir) / 'backend' / 'bin' / 'windows' / 'llama-server.exe',
+                        Path(bundle_dir) / 'backend' / 'bin' / 'llama-server.exe',
+                        Path(bundle_dir) / 'llama-server.exe',
+                    ])
+
+                possible_paths.extend([
+                    # Current Unix-like bundle layouts.
                     Path(bundle_dir) / 'backend' / 'bin' / 'llama-server',
+                    Path(bundle_dir) / 'backend' / 'bin' / 'linux' / 'llama-server',
                     # Backward-compatible legacy locations.
                     Path(bundle_dir) / 'llama' / 'llama-server',
                     Path(bundle_dir) / '../Frameworks/llama' / 'llama-server',
@@ -118,7 +131,7 @@ class LlamaWrapper:
                     # Additional macOS bundle variants.
                     Path(bundle_dir) / '../Frameworks' / 'backend' / 'bin' / 'llama-server',
                     Path(bundle_dir) / '../MacOS' / 'backend' / 'bin' / 'llama-server',
-                ]
+                ])
                 
                 bundled_path = None
                 for path in possible_paths:
@@ -131,7 +144,11 @@ class LlamaWrapper:
                     print(f"✅ Using bundled llama-server: {bundled_path}")
                 else:
                     # If not found, show the primary expected location first.
-                    expected = Path(bundle_dir) / 'backend' / 'bin' / 'llama-server'
+                    expected = (
+                        Path(bundle_dir) / 'backend' / 'bin' / 'windows' / 'llama-server.exe'
+                        if sys.platform == 'win32'
+                        else Path(bundle_dir) / 'backend' / 'bin' / 'llama-server'
+                    )
                     raise FileNotFoundError(
                         f"Bundled llama-server not found!\n"
                         f"Expected at: {expected}\n"
@@ -247,10 +264,19 @@ class LlamaWrapper:
             print(f"🧹 [LlamaWrapper #{self.instance_id}] Cleaning up old server")
             self._stop_server()
         
-        # Always bind to the expected port (app assumes 8080)
-        self.server_port = 8080
+        # Prefer existing port (or 8080), but fall back if it's stuck.
+        preferred_port = self.server_port or 8080
+        self.server_port = self._pick_free_port(preferred_port)
         if not self._ensure_port_free(self.server_port, wait_seconds=5.0):
-            raise RuntimeError(f"llama-server port {self.server_port} is still in use")
+            fallback_port = self._pick_free_port(0)
+            if fallback_port != self.server_port:
+                self.server_port = fallback_port
+                print(
+                    f"⚠️  [LlamaWrapper #{self.instance_id}] "
+                    f"Port {preferred_port} busy; falling back to {self.server_port}"
+                )
+            if not self._ensure_port_free(self.server_port, wait_seconds=5.0):
+                raise RuntimeError(f"llama-server port {self.server_port} is still in use")
         
         # Build command for llama-server
         cmd = self._build_server_command(model_path)
@@ -268,6 +294,7 @@ class LlamaWrapper:
                 universal_newlines=True,
                 env=launch_env,
                 cwd=str(self.llama_cpp_path.parent),
+                **background_process_kwargs(new_process_group=True),
             )
         except Exception as e:
             print(f"❌ [LlamaWrapper #{self.instance_id}] Failed to start server: {e}")
@@ -311,6 +338,20 @@ class LlamaWrapper:
             return False
         finally:
             sock.close()
+
+    def _pick_free_port(self, preferred_port: int) -> int:
+        """Pick a free local port, preferring the requested one if available."""
+        if preferred_port and self._is_port_free(preferred_port):
+            return preferred_port
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            return port
+        except Exception:
+            return preferred_port
 
     def _ensure_port_free(self, port: int, wait_seconds: float = 3.0) -> bool:
         if self._is_port_free(port):
@@ -357,6 +398,54 @@ class LlamaWrapper:
 
         return self._is_port_free(port)
 
+    def _pids_listening_on_port(self, port: int) -> list:
+        """Return PIDs with a LISTEN socket on the given TCP port (best-effort)."""
+        inodes = set()
+        try:
+            with open("/proc/net/tcp", "r") as f:
+                next(f, None)  # skip header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local_addr = parts[1]
+                    state = parts[3]
+                    inode = parts[9]
+                    if state != "0A":  # LISTEN
+                        continue
+                    ip_hex, port_hex = local_addr.split(":")
+                    if int(port_hex, 16) == port:
+                        inodes.add(inode)
+        except Exception:
+            return []
+
+        if not inodes:
+            return []
+
+        pids = []
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                fd_dir = Path(f"/proc/{pid}/fd")
+                if not fd_dir.exists():
+                    continue
+                try:
+                    for fd in fd_dir.iterdir():
+                        try:
+                            target = os.readlink(fd)
+                        except Exception:
+                            continue
+                        if target.startswith("socket:[") and target[8:-1] in inodes:
+                            pids.append(pid)
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        return pids
+
     def _kill_port_holder(self, port: int) -> bool:
         """Best-effort kill of a llama-server process holding the given port."""
         pids = []
@@ -386,6 +475,9 @@ class LlamaWrapper:
                             pids.append(int(pid_str))
         except Exception:
             pids = []
+
+        if not pids:
+            pids = self._pids_listening_on_port(port)
 
         if not pids:
             return False
@@ -474,7 +566,11 @@ class LlamaWrapper:
                     try:
                         self.server_process.wait(timeout=1)
                     except:
-                        self.server_process.kill()
+                        # Kill whole process group if possible (llama-server may fork)
+                        try:
+                            os.killpg(self.server_process.pid, signal.SIGKILL)
+                        except Exception:
+                            self.server_process.kill()
                         self.server_process.wait()
             except Exception as e:
                 print(f"⚠️  [LlamaWrapper #{self.instance_id}] Error stopping server: {e}")
@@ -486,14 +582,29 @@ class LlamaWrapper:
                         while time.time() < deadline and self.server_process.poll() is None:
                             time.sleep(0.1)
                         if self.server_process.poll() is None:
-                            self.server_process.kill()
+                            try:
+                                os.killpg(self.server_process.pid, signal.SIGKILL)
+                            except Exception:
+                                self.server_process.kill()
+                    # If the port is still held, try killing the process group (server may have forked).
+                    if self.server_process and not self._is_port_free(self.server_port):
+                        try:
+                            os.killpg(self.server_process.pid, signal.SIGTERM)
+                            time.sleep(0.2)
+                            if not self._is_port_free(self.server_port):
+                                os.killpg(self.server_process.pid, signal.SIGKILL)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 self.server_process = None
                 self.current_model = None
                 self.server_ready = False
                 # Wait for port to be released (shutdown can be slow)
-                self._ensure_port_free(self.server_port, wait_seconds=5.0)
+                self._ensure_port_free(self.server_port, wait_seconds=10.0)
+        else:
+            # No tracked process; still try to free the port if something else is holding it.
+            self._ensure_port_free(self.server_port, wait_seconds=10.0)
     
     def generate_streaming(
         self,
@@ -700,8 +811,17 @@ class LlamaWrapper:
             if self.server_process is not None:
                 self._stop_server()
             # Give the OS time to release the port, then retry start a few times.
-            if not self._ensure_port_free(self.server_port, wait_seconds=8.0):
-                raise RuntimeError(f"llama-server port {self.server_port} is still in use")
+            preferred_port = self.server_port or 8080
+            if not self._ensure_port_free(preferred_port, wait_seconds=8.0):
+                # Fall back to a free port if 8080 stays stuck.
+                self.server_port = self._pick_free_port(preferred_port)
+                if self.server_port != preferred_port:
+                    print(
+                        f"⚠️  [LlamaWrapper #{self.instance_id}] "
+                        f"Port {preferred_port} busy; falling back to {self.server_port}"
+                    )
+                if not self._ensure_port_free(self.server_port, wait_seconds=5.0):
+                    raise RuntimeError(f"llama-server port {self.server_port} is still in use")
 
             for attempt in range(3):
                 if self._start_server(model_path):

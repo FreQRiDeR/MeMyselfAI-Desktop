@@ -62,12 +62,12 @@ if [[ ! -d "$DIST_DIR/$APP_NAME" ]]; then
   exit 1
 fi
 
-echo "Validating bundled backend/bin artifacts..."
+echo "Validating bundled backend/bin/linux artifacts..."
 missing_bins=()
 bundle_roots=("$DIST_DIR/$APP_NAME" "$DIST_DIR/$APP_NAME/_internal")
 while IFS= read -r -d '' src; do
   name="$(basename "$src")"
-  expected_rel="backend/bin/$name"
+  expected_rel="backend/bin/linux/$name"
   found=false
   for root in "${bundle_roots[@]}"; do
     if [[ -f "$root/$expected_rel" ]]; then
@@ -78,7 +78,7 @@ while IFS= read -r -d '' src; do
   if [[ "$found" == "false" ]]; then
     missing_bins+=("$DIST_DIR/$APP_NAME/$expected_rel")
   fi
-done < <(find "$ROOT_DIR/backend/bin" -maxdepth 1 -type f -print0)
+done < <(find "$ROOT_DIR/backend/bin/linux" -maxdepth 1 -type f -print0)
 
 
 if (( ${#missing_bins[@]} > 0 )); then
