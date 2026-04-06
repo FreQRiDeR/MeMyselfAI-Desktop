@@ -57,6 +57,7 @@ class Config:
         "theme": "system",  # system, light, dark
         "font_family": "SF Pro",  # Chat font family
         "font_size": 13,  # Chat font size
+        "internet_enabled": False,  # Toggle for model internet_search tool usage
         "inference_timeout": 300  # Seconds to wait for model response (all backends)
     }
     

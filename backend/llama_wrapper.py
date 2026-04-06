@@ -613,7 +613,10 @@ class LlamaWrapper:
         max_tokens: int = 512,
         temperature: float = 0.7,
         callback: Optional[Callable[[str], None]] = None,
-        messages: list = None
+        messages: list = None,
+        tools: Optional[list] = None,
+        tool_executor: Optional[Callable[[dict], dict]] = None,
+        max_tool_rounds: int = 3,
     ) -> Generator[str, None, None]:
         """
         Generate response with streaming output using HTTP API.
@@ -627,6 +630,9 @@ class LlamaWrapper:
             callback: Optional callback for each token
             messages: Full conversation history from main_window. If None,
                       falls back to a bare single-turn user prompt.
+            tools: Optional OpenAI-style tool list for pre-response tool resolution.
+            tool_executor: Callable that executes tool arguments and returns a dict.
+            max_tool_rounds: Maximum tool call rounds before final answer stream.
 
         Yields:
             Generated tokens as they arrive
@@ -644,6 +650,8 @@ class LlamaWrapper:
             request_start = time.time()
             first_token_time = None
             stream_usage = None
+            web_results_used = 0
+            web_sources = []
 
             # Use caller-supplied history; fall back to bare prompt if not provided
             chat_messages = messages if messages else [{"role": "user", "content": prompt}]
@@ -661,6 +669,17 @@ class LlamaWrapper:
                     f"⚠️  [LlamaWrapper #{self.instance_id}] "
                     f"Clamping max_tokens {max_tokens} -> {effective_max_tokens} "
                     f"(context_size={self.context_size})"
+                )
+
+            if tools and callable(tool_executor):
+                chat_messages, web_results_used, web_sources = self._resolve_tool_calls(
+                    url=url,
+                    chat_messages=chat_messages,
+                    max_tokens=effective_max_tokens,
+                    temperature=temperature,
+                    tools=tools,
+                    tool_executor=tool_executor,
+                    max_rounds=max_tool_rounds,
                 )
 
             payload = {
@@ -719,7 +738,7 @@ class LlamaWrapper:
 
             # Fallback estimates if usage is not returned by the server.
             if prompt_tokens is None:
-                prompt_chars = sum(len(m.get("content", "")) for m in chat_messages)
+                prompt_chars = sum(self._content_length(m.get("content", "")) for m in chat_messages)
                 prompt_tokens = max(1, prompt_chars // 4)
             if completion_tokens is None:
                 completion_tokens = max(1, len(full_response) // 4)
@@ -736,6 +755,8 @@ class LlamaWrapper:
                 "generation_tps": generation_tps,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "web_results_used": web_results_used,
+                "web_sources": web_sources,
             }
             prompt_tps_text = f"{prompt_tps:.1f}" if prompt_tps is not None else "n/a"
             generation_tps_text = f"{generation_tps:.1f}" if generation_tps is not None else "n/a"
@@ -758,6 +779,174 @@ class LlamaWrapper:
                 except Exception:
                     pass
                 self._active_response = None
+
+    @staticmethod
+    def _content_length(content) -> int:
+        if isinstance(content, str):
+            return len(content)
+        if content is None:
+            return 0
+        try:
+            return len(json.dumps(content, ensure_ascii=False))
+        except Exception:
+            return len(str(content))
+
+    @staticmethod
+    def _parse_tool_arguments(raw_args) -> dict:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            text = raw_args.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    @staticmethod
+    def _extract_text_tool_calls(content) -> list:
+        text = str(content or "")
+        if not text:
+            return []
+
+        calls = []
+        pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+        for idx, match in enumerate(pattern.finditer(text), start=1):
+            payload_text = match.group(1).strip()
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                continue
+            args = payload.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            calls.append(
+                {
+                    "id": f"text_tool_call_{idx}",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            )
+        return calls
+
+    @staticmethod
+    def _merge_web_sources(existing: list, tool_result: dict, limit: int = 5) -> list:
+        merged = list(existing or [])
+        seen_urls = {str(item.get("url", "")).strip() for item in merged if isinstance(item, dict)}
+
+        for entry in (tool_result or {}).get("results", []) or []:
+            if len(merged) >= limit:
+                break
+            if not isinstance(entry, dict):
+                continue
+            url = str(entry.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged.append(
+                {
+                    "title": str(entry.get("title", "")).strip() or url,
+                    "url": url,
+                }
+            )
+
+        return merged[:limit]
+
+    def _resolve_tool_calls(
+        self,
+        url: str,
+        chat_messages: list,
+        max_tokens: int,
+        temperature: float,
+        tools: list,
+        tool_executor: Callable[[dict], dict],
+        max_rounds: int = 3,
+    ) -> tuple:
+        resolved_messages = list(chat_messages)
+        web_results_used = 0
+        web_sources = []
+
+        for _ in range(max(1, int(max_rounds))):
+            response = requests.post(
+                url,
+                json={
+                    "messages": resolved_messages,
+                    "stream": False,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                },
+                timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            choices = payload.get("choices") or []
+            if not choices:
+                break
+
+            message = choices[0].get("message") or {}
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                tool_calls = self._extract_text_tool_calls(message.get("content", ""))
+            if not tool_calls:
+                break
+
+            resolved_messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content", ""),
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for tool_call in tool_calls:
+                function_payload = tool_call.get("function") or {}
+                tool_name = function_payload.get("name")
+                tool_args = self._parse_tool_arguments(function_payload.get("arguments"))
+                tool_result = tool_executor(tool_args)
+                if tool_name == "internet_search":
+                    web_results_used += 1
+                    web_sources = self._merge_web_sources(web_sources, tool_result, limit=5)
+
+                tool_message = {
+                    "role": "tool",
+                    "name": tool_name or "internet_search",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+                tool_call_id = tool_call.get("id")
+                if tool_call_id:
+                    tool_message["tool_call_id"] = tool_call_id
+                resolved_messages.append(tool_message)
+
+        if web_results_used > 0:
+            resolved_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "You already have internet search results. "
+                        "Provide the final answer now in plain text. "
+                        "Do not output <tool_call> tags or request more tools."
+                    ),
+                }
+            )
+        return resolved_messages, web_results_used, web_sources
 
     def get_last_generation_stats(self) -> dict:
         """Return stats from the most recent streamed generation."""
@@ -864,11 +1053,11 @@ class LlamaWrapper:
         if messages[0].get("role") == "system":
             trimmed.append(messages[0])
             start_idx = 1
-            budget_chars -= len(messages[0].get("content", ""))
+            budget_chars -= self._content_length(messages[0].get("content", ""))
 
         for msg in reversed(messages[start_idx:]):
             content = msg.get("content", "")
-            cost = len(content)
+            cost = self._content_length(content)
             if budget_chars - cost < 0:
                 break
             trimmed.append(msg)

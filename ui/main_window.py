@@ -5,7 +5,7 @@ Main application window with chat history side pane
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QLineEdit, QPushButton, QComboBox,
+    QTextBrowser, QLineEdit, QPushButton, QComboBox,
     QLabel, QMessageBox, QStatusBar, QListWidget,
     QListWidgetItem, QFrame, QFileDialog
 )
@@ -14,6 +14,8 @@ from PyQt6.QtGui import QAction, QColor, QFont, QTextCharFormat, QTextCursor, QP
 import sys
 import base64
 import mimetypes
+import time
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -33,7 +35,17 @@ class GenerationThread(QThread):
     generation_complete = pyqtSignal(dict)
     generation_error    = pyqtSignal(str)
 
-    def __init__(self, backend, model, prompt, max_tokens, temperature, system_prompt="", messages=None):
+    def __init__(
+        self,
+        backend,
+        model,
+        prompt,
+        max_tokens,
+        temperature,
+        system_prompt="",
+        messages=None,
+        internet_enabled: bool = False,
+    ):
         super().__init__()
         self.backend       = backend
         self.model         = model
@@ -42,17 +54,40 @@ class GenerationThread(QThread):
         self.temperature   = temperature
         self.system_prompt = system_prompt
         self.messages      = messages
+        self.internet_enabled = bool(internet_enabled)
 
     def run(self):
         try:
             full_prompt = self.prompt
             if self.system_prompt:
                 full_prompt = f"[SYSTEM]: {self.system_prompt}\n\n[USER]: {self.prompt}"
+
+            # Batch tiny token chunks to reduce cross-thread signal overhead.
+            emit_buffer = []
+            emit_chars = 0
+            last_emit = time.perf_counter()
+
+            def flush_buffer():
+                nonlocal emit_buffer, emit_chars, last_emit
+                if not emit_buffer:
+                    return
+                self.token_generated.emit("".join(emit_buffer))
+                emit_buffer = []
+                emit_chars = 0
+                last_emit = time.perf_counter()
+
             for token in self.backend.generate_streaming(
                 self.model, full_prompt, self.max_tokens, self.temperature,
-                messages=self.messages
+                messages=self.messages,
+                internet_enabled=self.internet_enabled,
             ):
-                self.token_generated.emit(token)
+                emit_buffer.append(token)
+                emit_chars += len(token)
+                now = time.perf_counter()
+                if emit_chars >= 32 or (now - last_emit) >= 0.035:
+                    flush_buffer()
+
+            flush_buffer()
             stats = {}
             if hasattr(self.backend, "get_last_generation_stats"):
                 stats = self.backend.get_last_generation_stats() or {}
@@ -82,6 +117,7 @@ class MainWindow(QMainWindow):
         self._backend_signature = None
         self.prompt_manager     = SystemPromptManager()
         self.attached_files     = []  # List of file paths attached to next message
+        self.internet_enabled   = bool(self.config.get("internet_enabled", False))
 
         self.init_ui()
         self.load_configuration()
@@ -242,8 +278,9 @@ class MainWindow(QMainWindow):
 
         chat_layout.addLayout(self.create_top_bar())
 
-        self.chat_display = QTextEdit()
+        self.chat_display = QTextBrowser()
         self.chat_display.setReadOnly(True)
+        self.chat_display.setOpenExternalLinks(True)
         self.chat_display.setPlaceholderText("Start a conversation…")
         # Apply font from config
         font_family = self.config.get("font_family", "SF Pro")
@@ -424,6 +461,13 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.message_input, stretch=1)
 
+        self.web_button = QPushButton("🌐")
+        self.web_button.setFixedSize(36, 36)
+        self.web_button.setToolTip("Allow model tool-calls to run internet search")
+        self.web_button.clicked.connect(self.toggle_web_mode)
+        self._update_web_button_style()
+        layout.addWidget(self.web_button)
+
         self.send_button = QPushButton("Send")
         self.send_button.setMinimumWidth(80)
         self.send_button.setStyleSheet("""
@@ -457,6 +501,39 @@ class MainWindow(QMainWindow):
         self.stop_button.setVisible(False)
         layout.addWidget(self.stop_button)
         return layout
+
+    def _update_web_button_style(self):
+        if self.internet_enabled:
+            self.web_button.setStyleSheet("""
+                QPushButton {
+                    background: #0A84FF; color: #FFFFFF;
+                    border: 1px solid #3A3A3C; border-radius: 6px;
+                    padding: 0px; font-size: 16px; font-weight: 600;
+                }
+                QPushButton:hover {
+                    background: #409CFF;
+                    border-color: #e009a7;
+                }
+            """)
+        else:
+            self.web_button.setStyleSheet("""
+                QPushButton {
+                    background: #2C2C2E; color: #EBEBF5;
+                    border: 1px solid #3A3A3C; border-radius: 6px;
+                    padding: 0px; font-size: 16px;
+                }
+                QPushButton:hover {
+                    background: #3A3A3C;
+                    border-color: #e009a7;
+                }
+            """)
+
+    def toggle_web_mode(self):
+        self.internet_enabled = not self.internet_enabled
+        self._update_web_button_style()
+        self.config.set("internet_enabled", self.internet_enabled)
+        state = "enabled" if self.internet_enabled else "disabled"
+        self.status_bar.showMessage(f"Internet search {state}")
     
     def closeEvent(self, event):
         """Clean up when closing the application"""
@@ -1057,7 +1134,8 @@ class MainWindow(QMainWindow):
             self.config.get("max_tokens", 512),
             self.config.get("temperature", 0.7),
             system_prompt_text,
-            messages=messages
+            messages=messages,
+            internet_enabled=self.internet_enabled,
         )
         self.generation_thread.token_generated.connect(self.on_token_generated)
         self.generation_thread.generation_complete.connect(self.on_generation_complete)
@@ -1085,6 +1163,41 @@ class MainWindow(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         prompt_tps = stats.get("prompt_tps")
         generation_tps = stats.get("generation_tps")
+        web_results_used = stats.get("web_results_used", 0) or 0
+        web_sources = stats.get("web_sources", []) or []
+        try:
+            web_results_used = int(web_results_used)
+        except (TypeError, ValueError):
+            web_results_used = 0
+
+        if web_results_used > 0:
+            cursor.insertText("\n")
+            web_format = QTextCharFormat()
+            web_format.setForeground(QColor("#0A84FF"))
+            web_format.setFont(QFont("SF Pro", 13))
+            label = "Web results used" if web_results_used == 1 else f"Web results used ({web_results_used})"
+            cursor.insertText(f"[ {label} ]", web_format)
+
+        if isinstance(web_sources, list) and web_sources:
+            cursor.insertText("\n")
+            src_format = QTextCharFormat()
+            src_format.setForeground(QColor("#4DA3FF"))
+            src_format.setFont(QFont("SF Pro", 12))
+            cursor.insertText("[ Sources ]\n", src_format)
+            for idx, source in enumerate(web_sources[:3], start=1):
+                if not isinstance(source, dict):
+                    continue
+                title = str(source.get("title", "")).strip() or f"Source {idx}"
+                url = str(source.get("url", "")).strip()
+                if not url:
+                    continue
+                safe_title = escape(title)
+                safe_url = escape(url, quote=True)
+                cursor.insertHtml(
+                    f'<a href="{safe_url}" style="color:#4DA3FF; text-decoration: underline;">'
+                    f'{idx}. {safe_title}</a><br>'
+                )
+
         if prompt_tps is not None and generation_tps is not None:
             cursor.insertText("\n")
             stats_format = QTextCharFormat()
@@ -1189,6 +1302,8 @@ class MainWindow(QMainWindow):
             font_family = self.config.get("font_family", "SF Pro")
             font_size = self.config.get("font_size", 13)
             self.chat_display.setFont(QFont(font_family, font_size))
+            self.internet_enabled = bool(self.config.get("internet_enabled", False))
+            self._update_web_button_style()
             self.load_configuration()
 
     def open_model_manager(self):

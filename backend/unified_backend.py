@@ -5,12 +5,16 @@ Unified backend supporting local llama.cpp, remote llama-server, Ollama, and Hug
 
 import sys
 import json
+import re
 import requests
 import subprocess
 import time
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Generator, Optional, Callable
+from html import unescape
 from pathlib import Path
+from urllib.parse import quote
 from backend.process_utils import background_process_kwargs
 
 
@@ -142,6 +146,493 @@ class UnifiedBackend:
             'base_url': base_url,
             'headers': headers,
         }
+
+    @staticmethod
+    def _message_content_length(content) -> int:
+        if isinstance(content, str):
+            return len(content)
+        if content is None:
+            return 0
+        try:
+            return len(json.dumps(content, ensure_ascii=False))
+        except Exception:
+            return len(str(content))
+
+    @staticmethod
+    def _clamp_int(value, default: int, min_value: int, max_value: int) -> int:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            result = default
+        return max(min_value, min(max_value, result))
+
+    @staticmethod
+    def _internet_tool_spec() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "internet_search",
+                "description": (
+                    "Search the internet for up-to-date information and return concise "
+                    "results with source URLs."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to look up on the internet."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Number of results to return (1-8).",
+                            "minimum": 1,
+                            "maximum": 8
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
+
+    @staticmethod
+    def _parse_tool_arguments(raw_args) -> dict:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            text = raw_args.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    @staticmethod
+    def _extract_text_tool_calls(content) -> list:
+        text = str(content or "")
+        if not text:
+            return []
+
+        calls = []
+        pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+        for idx, match in enumerate(pattern.finditer(text), start=1):
+            payload_text = match.group(1).strip()
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                continue
+            args = payload.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            calls.append(
+                {
+                    "id": f"text_tool_call_{idx}",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            )
+
+        return calls
+
+    @staticmethod
+    def _force_final_answer_instruction() -> str:
+        return (
+            "You already have internet search results. "
+            "Provide the final answer now in plain text. "
+            "Do not output <tool_call> tags or request more tools."
+        )
+
+    def _run_internet_tool(self, args: dict) -> dict:
+        query = str((args or {}).get("query", "")).strip()
+        max_results = self._clamp_int((args or {}).get("max_results", 5), default=5, min_value=1, max_value=8)
+        return self._internet_search(query=query, max_results=max_results)
+
+    @staticmethod
+    def _merge_web_sources(existing: list, tool_result: dict, limit: int = 5) -> list:
+        merged = list(existing or [])
+        seen_urls = {str(item.get("url", "")).strip() for item in merged if isinstance(item, dict)}
+
+        for entry in (tool_result or {}).get("results", []) or []:
+            if len(merged) >= limit:
+                break
+            if not isinstance(entry, dict):
+                continue
+            url = str(entry.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged.append(
+                {
+                    "title": str(entry.get("title", "")).strip() or url,
+                    "url": url,
+                }
+            )
+        return merged[:limit]
+
+    @staticmethod
+    def _extract_text_content(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text = str(part.get("text", "")).strip()
+                    if text:
+                        parts.append(text)
+            return "\n".join(parts).strip()
+        return str(content or "").strip()
+
+    def _latest_user_query(self, chat_messages: list, prompt: str = "") -> str:
+        for msg in reversed(chat_messages or []):
+            if str(msg.get("role", "")).lower() != "user":
+                continue
+            text = self._extract_text_content(msg.get("content", ""))
+            if text:
+                return text
+        return str(prompt or "").strip()
+
+    @staticmethod
+    def _should_force_web_search(query: str) -> bool:
+        text = str(query or "").strip().lower()
+        if not text:
+            return False
+        triggers = (
+            "internet", "web", "search", "browse", "look up", "lookup",
+            "latest", "current", "today", "verify", "fact-check", "fact check",
+            "check your results", "news",
+        )
+        return any(token in text for token in triggers)
+
+    def _build_web_context_message(self, tool_result: dict) -> str:
+        query = str((tool_result or {}).get("query", "")).strip()
+        fetched_at = str((tool_result or {}).get("fetched_at", "")).strip()
+        results = (tool_result or {}).get("results", []) or []
+        error = str((tool_result or {}).get("error", "")).strip()
+        lines = [
+            "INTERNET_SEARCH_RESULTS (auto-fetched by app):",
+            f"Query: {query}" if query else "Query: (empty)",
+        ]
+        if fetched_at:
+            lines.append(f"Fetched at: {fetched_at}")
+        if results:
+            lines.append("Top results:")
+            for idx, entry in enumerate(results[:5], start=1):
+                title = str(entry.get("title", "")).strip() or "(untitled)"
+                url = str(entry.get("url", "")).strip() or "(no url)"
+                snippet = str(entry.get("snippet", "")).strip()
+                lines.append(f"{idx}. {title}")
+                lines.append(f"   URL: {url}")
+                if snippet:
+                    lines.append(f"   Snippet: {snippet[:320]}")
+        elif error:
+            lines.append(f"Search error: {error}")
+
+        lines.append(
+            "Use these web results in your next answer. If citing facts, include source URLs."
+        )
+        return "\n".join(lines)
+
+    def _apply_forced_web_context_if_needed(
+        self,
+        chat_messages: list,
+        prompt: str,
+        internet_enabled: bool,
+        web_results_used: int,
+        web_sources: list = None,
+    ) -> tuple:
+        if not internet_enabled or web_results_used > 0:
+            return chat_messages, web_results_used, list(web_sources or [])
+
+        query = self._latest_user_query(chat_messages, prompt=prompt)
+        if not self._should_force_web_search(query):
+            return chat_messages, web_results_used, list(web_sources or [])
+
+        tool_result = self._internet_search(query=query, max_results=5)
+        context_msg = self._build_web_context_message(tool_result)
+        updated_messages = list(chat_messages)
+        updated_messages.append({"role": "system", "content": context_msg})
+        merged_sources = self._merge_web_sources(web_sources or [], tool_result, limit=5)
+
+        if (tool_result.get("results") or []):
+            web_results_used += 1
+        return updated_messages, web_results_used, merged_sources
+
+    def _internet_search(self, query: str, max_results: int = 5) -> dict:
+        query = str(query or "").strip()
+        max_results = self._clamp_int(max_results, default=5, min_value=1, max_value=8)
+        if not query:
+            return {
+                "query": query,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "results": [],
+                "error": "Empty query"
+            }
+
+        headers = {"User-Agent": "MeMyselfAI/1.0"}
+        results = []
+        errors = []
+        seen_urls = set()
+
+        def add_result(title: str, url: str, snippet: str):
+            if len(results) >= max_results:
+                return
+            clean_url = str(url or "").strip()
+            if not clean_url or clean_url in seen_urls:
+                return
+            seen_urls.add(clean_url)
+            results.append({
+                "title": str(title or "").strip()[:180] or clean_url,
+                "url": clean_url,
+                "snippet": str(snippet or "").strip()[:500]
+            })
+
+        def add_duck_topics(items):
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if len(results) >= max_results:
+                    return
+                if not isinstance(item, dict):
+                    continue
+                nested = item.get("Topics")
+                if isinstance(nested, list):
+                    add_duck_topics(nested)
+                text = str(item.get("Text", "")).strip()
+                url = str(item.get("FirstURL", "")).strip()
+                if not text or not url:
+                    continue
+                title = text.split(" - ", 1)[0]
+                add_result(title, url, text)
+
+        try:
+            response = requests.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q": query,
+                    "format": "json",
+                    "no_html": 1,
+                    "no_redirect": 1,
+                    "skip_disambig": 1,
+                },
+                headers=headers,
+                timeout=min(12, self.inference_timeout),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            abstract = str(payload.get("AbstractText", "")).strip()
+            if abstract:
+                heading = str(payload.get("Heading", "")).strip() or query
+                abstract_url = str(payload.get("AbstractURL", "")).strip()
+                if abstract_url:
+                    add_result(heading, abstract_url, abstract)
+            add_duck_topics(payload.get("RelatedTopics", []))
+        except Exception as exc:
+            errors.append(f"DuckDuckGo: {exc}")
+
+        # Fallback source for broader recall when DDG Instant has sparse results.
+        if len(results) < max_results:
+            try:
+                remaining = max_results - len(results)
+                response = requests.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": query,
+                        "srlimit": remaining,
+                        "utf8": 1,
+                        "format": "json",
+                    },
+                    headers=headers,
+                    timeout=min(12, self.inference_timeout),
+                )
+                response.raise_for_status()
+                wiki_payload = response.json()
+                for entry in wiki_payload.get("query", {}).get("search", []):
+                    title = str(entry.get("title", "")).strip()
+                    if not title:
+                        continue
+                    snippet_html = str(entry.get("snippet", ""))
+                    snippet = unescape(re.sub(r"<[^>]+>", "", snippet_html))
+                    url = f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+                    add_result(title, url, snippet)
+            except Exception as exc:
+                errors.append(f"Wikipedia: {exc}")
+
+        result_payload = {
+            "query": query,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "results": results[:max_results],
+        }
+        if errors and not results:
+            result_payload["error"] = " | ".join(errors)
+        elif errors:
+            result_payload["warnings"] = errors
+        return result_payload
+
+    def _resolve_llama_server_internet_tools(
+        self,
+        chat_messages: list,
+        max_tokens: int,
+        temperature: float,
+        max_rounds: int = 3,
+    ) -> tuple:
+        resolved_messages = list(chat_messages)
+        tool_spec = [self._internet_tool_spec()]
+        web_results_used = 0
+        web_sources = []
+
+        for _ in range(max_rounds):
+            response = requests.post(
+                self._llama_server_chat_url(self.llama_server_url),
+                headers=self._llama_server_headers(self.llama_server_api_key),
+                json={
+                    "messages": resolved_messages,
+                    "stream": False,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "tools": tool_spec,
+                    "tool_choice": "auto",
+                },
+                timeout=self.inference_timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            choices = payload.get("choices") or []
+            if not choices:
+                break
+
+            message = choices[0].get("message") or {}
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                tool_calls = self._extract_text_tool_calls(message.get("content", ""))
+            if not tool_calls:
+                break
+
+            assistant_message = {
+                "role": "assistant",
+                "content": message.get("content", ""),
+                "tool_calls": tool_calls,
+            }
+            resolved_messages.append(assistant_message)
+
+            for call in tool_calls:
+                function_payload = call.get("function") or {}
+                tool_name = function_payload.get("name")
+                tool_args = self._parse_tool_arguments(function_payload.get("arguments"))
+
+                if tool_name == "internet_search":
+                    tool_result = self._run_internet_tool(tool_args)
+                    web_results_used += 1
+                    web_sources = self._merge_web_sources(web_sources, tool_result, limit=5)
+                else:
+                    tool_result = {"error": f"Unsupported tool: {tool_name}"}
+
+                tool_message = {
+                    "role": "tool",
+                    "name": tool_name or "internet_search",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+                tool_call_id = call.get("id")
+                if tool_call_id:
+                    tool_message["tool_call_id"] = tool_call_id
+                resolved_messages.append(tool_message)
+
+        if web_results_used > 0:
+            resolved_messages.append(
+                {"role": "system", "content": self._force_final_answer_instruction()}
+            )
+        return resolved_messages, web_results_used, web_sources
+
+    def _resolve_ollama_internet_tools(
+        self,
+        target: dict,
+        chat_messages: list,
+        max_tokens: int,
+        temperature: float,
+        max_rounds: int = 3,
+    ) -> tuple:
+        resolved_messages = list(chat_messages)
+        tool_spec = [self._internet_tool_spec()]
+        web_results_used = 0
+        web_sources = []
+
+        for _ in range(max_rounds):
+            response = requests.post(
+                self._ollama_api_url(target['base_url'], 'chat'),
+                headers=target['headers'],
+                json={
+                    "model": target['request_model'],
+                    "messages": resolved_messages,
+                    "stream": False,
+                    "tools": tool_spec,
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": temperature,
+                    },
+                },
+                timeout=self.inference_timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            message = payload.get("message") or {}
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                tool_calls = self._extract_text_tool_calls(message.get("content", ""))
+            if not tool_calls:
+                break
+
+            assistant_message = {
+                "role": "assistant",
+                "content": message.get("content", ""),
+                "tool_calls": tool_calls,
+            }
+            resolved_messages.append(assistant_message)
+
+            for call in tool_calls:
+                function_payload = call.get("function") or {}
+                tool_name = function_payload.get("name")
+                tool_args = self._parse_tool_arguments(function_payload.get("arguments"))
+
+                if tool_name == "internet_search":
+                    tool_result = self._run_internet_tool(tool_args)
+                    web_results_used += 1
+                    web_sources = self._merge_web_sources(web_sources, tool_result, limit=5)
+                else:
+                    tool_result = {"error": f"Unsupported tool: {tool_name}"}
+
+                resolved_messages.append(
+                    {
+                        "role": "tool",
+                        "name": tool_name or "internet_search",
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                )
+
+        if web_results_used > 0:
+            resolved_messages.append(
+                {"role": "system", "content": self._force_final_answer_instruction()}
+            )
+        return resolved_messages, web_results_used, web_sources
     
     def _start_ollama_if_needed(self):
         """Start Ollama serve process if using bundled Ollama"""
@@ -203,7 +694,8 @@ class UnifiedBackend:
         max_tokens: int = 512,
         temperature: float = 0.7,
         callback: Optional[Callable[[str], None]] = None,
-        messages: list = None
+        messages: list = None,
+        internet_enabled: bool = False,
     ) -> Generator[str, None, None]:
         """
         Generate response with streaming.
@@ -216,16 +708,23 @@ class UnifiedBackend:
             callback: Optional callback for each token
             messages: Full conversation history as [{"role": ..., "content": ...}].
                       When provided and using Ollama, sent to /api/chat for context.
+            internet_enabled: Enable internet search tool-calling protocol.
 
         Yields:
             Generated tokens as they arrive
         """
         if self.backend_type == BackendType.LOCAL:
-            yield from self._local_generate(model, prompt, max_tokens, temperature, callback, messages)
+            yield from self._local_generate(
+                model, prompt, max_tokens, temperature, callback, messages, internet_enabled
+            )
         elif self.backend_type == BackendType.LLAMA_SERVER:
-            yield from self._llama_server_generate(model, prompt, max_tokens, temperature, callback, messages)
+            yield from self._llama_server_generate(
+                model, prompt, max_tokens, temperature, callback, messages, internet_enabled
+            )
         elif self.backend_type == BackendType.OLLAMA:
-            yield from self._ollama_generate(model, prompt, max_tokens, temperature, callback, messages)
+            yield from self._ollama_generate(
+                model, prompt, max_tokens, temperature, callback, messages, internet_enabled
+            )
         elif self.backend_type == BackendType.HUGGINGFACE:
             yield from self._hf_generate(model, prompt, max_tokens, temperature, callback)
     
@@ -236,12 +735,43 @@ class UnifiedBackend:
         max_tokens: int,
         temperature: float,
         callback: Optional[Callable[[str], None]],
-        messages: list = None
+        messages: list = None,
+        internet_enabled: bool = False,
     ) -> Generator[str, None, None]:
         """Generate using local llama.cpp"""
+        chat_messages = messages if messages else [{"role": "user", "content": prompt}]
+        forced_web_results_used = 0
+        forced_web_sources = []
+        if internet_enabled:
+            chat_messages, forced_web_results_used, forced_web_sources = self._apply_forced_web_context_if_needed(
+                chat_messages,
+                prompt=prompt,
+                internet_enabled=internet_enabled,
+                web_results_used=0,
+                web_sources=[],
+            )
+
+        tools = [self._internet_tool_spec()] if internet_enabled else None
         yield from self.local_wrapper.generate_streaming(
-            model_path, prompt, max_tokens, temperature, callback, messages
+            model_path,
+            prompt,
+            max_tokens,
+            temperature,
+            callback,
+            chat_messages,
+            tools=tools,
+            tool_executor=self._run_internet_tool if internet_enabled else None,
         )
+
+        if forced_web_results_used > 0 and hasattr(self.local_wrapper, "last_generation_stats"):
+            stats = dict(self.local_wrapper.get_last_generation_stats() or {})
+            stats["web_results_used"] = int(stats.get("web_results_used", 0) or 0) + forced_web_results_used
+            stats["web_sources"] = self._merge_web_sources(
+                stats.get("web_sources", []) or [],
+                {"results": forced_web_sources},
+                limit=5,
+            )
+            self.local_wrapper.last_generation_stats = stats
 
     def _llama_server_generate(
         self,
@@ -250,7 +780,8 @@ class UnifiedBackend:
         max_tokens: int,
         temperature: float,
         callback: Optional[Callable[[str], None]],
-        messages: list = None
+        messages: list = None,
+        internet_enabled: bool = False,
     ) -> Generator[str, None, None]:
         """Generate using a remote llama-server over HTTP + SSE."""
         try:
@@ -258,8 +789,21 @@ class UnifiedBackend:
             first_token_time = None
             stream_usage = None
             full_response = ""
+            web_results_used = 0
+            web_sources = []
 
             chat_messages = messages if messages else [{"role": "user", "content": prompt}]
+            if internet_enabled:
+                chat_messages, web_results_used, web_sources = self._resolve_llama_server_internet_tools(
+                    chat_messages, max_tokens=max_tokens, temperature=temperature
+                )
+            chat_messages, web_results_used, web_sources = self._apply_forced_web_context_if_needed(
+                chat_messages,
+                prompt=prompt,
+                internet_enabled=internet_enabled,
+                web_results_used=web_results_used,
+                web_sources=web_sources,
+            )
             payload = {
                 "messages": chat_messages,
                 "stream": True,
@@ -328,7 +872,9 @@ class UnifiedBackend:
                 completion_tokens = stream_usage.get("completion_tokens")
 
             if prompt_tokens is None:
-                prompt_chars = sum(len(str(m.get("content", ""))) for m in chat_messages)
+                prompt_chars = sum(
+                    self._message_content_length(m.get("content", "")) for m in chat_messages
+                )
                 prompt_tokens = max(1, prompt_chars // 4)
             if completion_tokens is None:
                 completion_tokens = max(1, len(full_response) // 4)
@@ -344,6 +890,8 @@ class UnifiedBackend:
                 "generation_tps": generation_tps,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "web_results_used": web_results_used,
+                "web_sources": web_sources,
             }
         finally:
             if self._active_response is not None:
@@ -360,13 +908,27 @@ class UnifiedBackend:
         max_tokens: int,
         temperature: float,
         callback: Optional[Callable[[str], None]],
-        messages: list = None
+        messages: list = None,
+        internet_enabled: bool = False,
     ) -> Generator[str, None, None]:
         """Generate using Ollama /api/chat with full conversation history"""
         try:
             # Use provided history, or wrap the bare prompt as a single user turn
             chat_messages = messages if messages else [{"role": "user", "content": prompt}]
             target = self._resolve_ollama_target(model)
+            web_results_used = 0
+            web_sources = []
+            if internet_enabled:
+                chat_messages, web_results_used, web_sources = self._resolve_ollama_internet_tools(
+                    target, chat_messages, max_tokens=max_tokens, temperature=temperature
+                )
+            chat_messages, web_results_used, web_sources = self._apply_forced_web_context_if_needed(
+                chat_messages,
+                prompt=prompt,
+                internet_enabled=internet_enabled,
+                web_results_used=web_results_used,
+                web_sources=web_sources,
+            )
             request_start = time.time()
             first_token_time = None
             full_response = ""
@@ -433,7 +995,9 @@ class UnifiedBackend:
                     generation_seconds = max(1e-9, eval_duration / 1_000_000_000)
 
             if prompt_tokens is None:
-                prompt_chars = sum(len(m.get("content", "")) for m in chat_messages)
+                prompt_chars = sum(
+                    self._message_content_length(m.get("content", "")) for m in chat_messages
+                )
                 prompt_tokens = max(1, prompt_chars // 4)
             if completion_tokens is None:
                 completion_tokens = max(1, len(full_response) // 4)
@@ -450,6 +1014,8 @@ class UnifiedBackend:
                 "generation_tps": generation_tps,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "web_results_used": web_results_used,
+                "web_sources": web_sources,
             }
 
         except requests.exceptions.HTTPError as e:
