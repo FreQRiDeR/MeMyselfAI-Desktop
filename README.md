@@ -3,17 +3,16 @@
              <h1>MeMyselfAi</h1>
 </div>
 
-# MeMyselfAI - macOS Desktop App
+# MeMyselfAI - Cross-platform Desktop App
 
-A native-feeling macOS chat application that wraps llama.cpp build.
+A Cross Platform chat application that wraps ollama and llama.cpp build.
 
 ## Features
 - 💬 Clean chat interface
 - 🤖 Local model support (uses llama.cpp)
-- ☁️ Ollama Model Library integration. (Requires Ollama server to be running locally.)
+- ☁️ Ollama Model Library integration.
 - ⚡ Real-time streaming responses
 - 📁 Model management
-- 🎨 Native macOS look and feel
 
 <div align="center">
              <img src="/window1.png" width="700" />
@@ -82,7 +81,7 @@ The app stores:
 
 ## Future Features
 - [ ] Network server mode (DONE!)
-- [ ] gRPC/WebSocket/HTTP+SSE support
+- [ ] gRPC/WebSocket/HTTP+SSE support (DONE)
 - [ ] Multi-model support
 - [ ] Conversation export
 - [ ] System prompt templates (DONE!)
