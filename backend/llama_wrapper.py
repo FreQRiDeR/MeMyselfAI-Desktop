@@ -236,8 +236,11 @@ class LlamaWrapper:
             env["DYLD_LIBRARY_PATH"] = (
                 f"{binary_dir}{os.pathsep}{existing}" if existing else binary_dir
             )
-            # Only relevant on macOS builds with Metal support.
-            env.setdefault("GGML_METAL_FULL_OFFLOAD", "0")
+
+            # Metal tuning
+            env["GGML_METAL_WAVE64_DECODE"] = "1"
+            env["GGML_METAL_CONCURRENCY_DISABLE"] = "1"
+            env["GGML_METAL_VRAM_RESERVE_MB"] = "1024"
 
         return env
     
@@ -286,6 +289,10 @@ class LlamaWrapper:
         
         launch_env = self._build_server_env()
         try:
+            print("launch_env:")
+            for k, v in launch_env.items():
+                if k.startswith("GGML_"):
+                    print(f"  {k}={v}")
             self.server_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
