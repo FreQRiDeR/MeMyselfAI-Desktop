@@ -185,6 +185,39 @@ class UnifiedBackend:
         }
 
     @staticmethod
+    def _is_ollama_chat_template_error(status_code: int, response_text: str = "") -> bool:
+        text = str(response_text or "").lower()
+        if status_code != 400:
+            return False
+        return (
+            'chat template' in text
+            or 'no chat template' in text
+            or 'does not support chat' in text
+            or 'chat_template' in text
+        )
+
+    @staticmethod
+    def _ollama_prompt_from_messages(messages: list) -> str:
+        if not messages:
+            return ""
+        lines = []
+        for message in messages:
+            role = str(message.get('role', 'user')).strip().lower()
+            content = message.get('content', '')
+            if isinstance(content, (list, dict)):
+                content = json.dumps(content, ensure_ascii=False)
+            content = str(content or '').strip()
+            if not content:
+                continue
+            if role == 'system':
+                lines.append(f"System: {content}")
+            elif role == 'assistant':
+                lines.append(f"Assistant: {content}")
+            else:
+                lines.append(f"User: {content}")
+        return "\n".join(lines).strip()
+
+    @staticmethod
     def _message_content_length(content) -> int:
         if isinstance(content, str):
             return len(content)
@@ -1899,6 +1932,41 @@ class UnifiedBackend:
 
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
+            response_text = e.response.text if e.response is not None else ""
+            if self._is_ollama_chat_template_error(status_code, response_text):
+                try:
+                    prompt = self._ollama_prompt_from_messages(chat_messages)
+                    response = requests.post(
+                        self._ollama_api_url(target['base_url'], 'generate'),
+                        headers=target['headers'],
+                        json={
+                            "model": target['request_model'],
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {
+                                "num_predict": max_tokens,
+                                "temperature": temperature,
+                            },
+                        },
+                        timeout=self.inference_timeout,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    text = payload.get('response', '') or ''
+                    if callback:
+                        callback(text)
+                    yield text
+                    self.last_generation_stats = {
+                        "prompt_tps": None,
+                        "generation_tps": None,
+                        "prompt_tokens": max(1, len(prompt) // 4),
+                        "completion_tokens": max(1, len(text) // 4),
+                        "web_results_used": 0,
+                        "web_sources": [],
+                    }
+                    return
+                except Exception as fallback_error:
+                    raise RuntimeError(f"Ollama API error: {fallback_error}") from fallback_error
             if status_code == 401:
                 if 'signin_url' in (e.response.text if e.response is not None else ''):
                     raise RuntimeError(
