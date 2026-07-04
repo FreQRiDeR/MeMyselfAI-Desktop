@@ -6,8 +6,10 @@ PyQt6==6.6.1
 PyQt6-Qt6==6.6.1
 
 # For future network features
-requests==2.31.0
-chardet>=5.2.0
+requests==2.32.3
+urllib3>=2.2.0,<3.0.0
+charset_normalizer>=2.0.0,<4.0.0
+chardet>=5.2.0,<6.0.0
 
 # For building app
 pyinstaller

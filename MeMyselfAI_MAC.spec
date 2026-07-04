@@ -104,7 +104,7 @@ if Path(metallib_path).exists():
 else:
     print(f"⚠️  WARNING: default.metallib not found at: {metallib_path}")
 
-# Collect networking deps used by requests, including optional charset/chardet backends.
+# Collect only the networking deps that this app actually uses.
 extra_datas = []
 extra_binaries = []
 extra_hiddenimports = []
@@ -114,7 +114,6 @@ for pkg_name in (
     'idna',
     'certifi',
     'charset_normalizer',
-    'chardet',
 ):
     try:
         d, b, h = collect_all(pkg_name)
@@ -141,21 +140,20 @@ a = Analysis(
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',
         'PyQt6.sip',
-        'chardet',
         'charset_normalizer',
         'charset_normalizer.api',
         'charset_normalizer.md',
         'charset_normalizer.cd',
         'requests',
     ] + extra_hiddenimports)),
-    hookspath=[],
+    hookspath=['hooks'],
     hooksconfig={
         'PyQt6': {
             'plugins': ['platforms', 'styles'],
         },
     },
     runtime_hooks=[],
-    excludes=[],
+    excludes=['urllib3.contrib.emscripten'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

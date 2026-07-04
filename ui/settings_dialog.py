@@ -290,7 +290,7 @@ class SettingsDialog(QDialog):
                 border-top: 5px solid #e009a7;
             }
         """)
-        self.max_tokens_input.setRange(1, 4096)
+        self.max_tokens_input.setRange(1, 280000)
         self.max_tokens_input.setSingleStep(64)
         params_layout.addRow("Max Tokens:", self.max_tokens_input)
         
@@ -442,8 +442,8 @@ class SettingsDialog(QDialog):
                 border-top: 5px solid #e009a7;
             }
         """)
-        self.context_size_input.setRange(512, 8192)
-        self.context_size_input.setSingleStep(512)
+        self.context_size_input.setRange(128, 2000000)
+        self.context_size_input.setSingleStep(128)
         params_layout.addRow("Context Size:", self.context_size_input)
         
         self.threads_input = QSpinBox()
