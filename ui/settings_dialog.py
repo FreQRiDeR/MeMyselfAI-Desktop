@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from pathlib import Path
+import json
 import re
 import shlex
 
@@ -335,6 +336,73 @@ class SettingsDialog(QDialog):
         self.temperature_input.setSingleStep(0.1)
         self.temperature_input.setDecimals(2)
         params_layout.addRow("Temperature:", self.temperature_input)
+
+        self.top_p_input = QDoubleSpinBox()
+        self.top_p_input.setRange(0.0, 1.0)
+        self.top_p_input.setSingleStep(0.05)
+        self.top_p_input.setDecimals(2)
+        self.top_p_input.setToolTip("Nucleus sampling. 1.0 uses the provider default/full distribution.")
+        self.top_p_input.setStyleSheet(self.temperature_input.styleSheet())
+        params_layout.addRow("Top P:", self.top_p_input)
+
+        self.top_k_input = QSpinBox()
+        self.top_k_input.setRange(0, 1000)
+        self.top_k_input.setSpecialValueText("Default")
+        self.top_k_input.setSingleStep(10)
+        self.top_k_input.setToolTip("Limits sampling to the top K tokens when supported. 0 leaves it unset.")
+        self.top_k_input.setStyleSheet(self.max_tokens_input.styleSheet())
+        params_layout.addRow("Top K:", self.top_k_input)
+
+        self.min_p_input = QDoubleSpinBox()
+        self.min_p_input.setRange(0.0, 1.0)
+        self.min_p_input.setSingleStep(0.01)
+        self.min_p_input.setDecimals(2)
+        self.min_p_input.setToolTip("Minimum probability sampling when supported. 0.0 leaves it unset.")
+        self.min_p_input.setStyleSheet(self.temperature_input.styleSheet())
+        params_layout.addRow("Min P:", self.min_p_input)
+
+        self.repeat_penalty_input = QDoubleSpinBox()
+        self.repeat_penalty_input.setRange(0.0, 2.0)
+        self.repeat_penalty_input.setSingleStep(0.05)
+        self.repeat_penalty_input.setDecimals(2)
+        self.repeat_penalty_input.setToolTip("Penalizes repeated tokens when supported. 1.0 leaves it neutral.")
+        self.repeat_penalty_input.setStyleSheet(self.temperature_input.styleSheet())
+        params_layout.addRow("Repeat Penalty:", self.repeat_penalty_input)
+
+        self.presence_penalty_input = QDoubleSpinBox()
+        self.presence_penalty_input.setRange(-2.0, 2.0)
+        self.presence_penalty_input.setSingleStep(0.1)
+        self.presence_penalty_input.setDecimals(2)
+        self.presence_penalty_input.setToolTip("OpenAI-style presence penalty. 0.0 leaves it neutral.")
+        self.presence_penalty_input.setStyleSheet(self.temperature_input.styleSheet())
+        params_layout.addRow("Presence Penalty:", self.presence_penalty_input)
+
+        self.frequency_penalty_input = QDoubleSpinBox()
+        self.frequency_penalty_input.setRange(-2.0, 2.0)
+        self.frequency_penalty_input.setSingleStep(0.1)
+        self.frequency_penalty_input.setDecimals(2)
+        self.frequency_penalty_input.setToolTip("OpenAI-style frequency penalty. 0.0 leaves it neutral.")
+        self.frequency_penalty_input.setStyleSheet(self.temperature_input.styleSheet())
+        params_layout.addRow("Frequency Penalty:", self.frequency_penalty_input)
+
+        self.seed_input = QSpinBox()
+        self.seed_input.setRange(-1, 2147483647)
+        self.seed_input.setSpecialValueText("Random")
+        self.seed_input.setToolTip("Fixed seed when supported. -1 leaves provider randomness/default.")
+        self.seed_input.setStyleSheet(self.max_tokens_input.styleSheet())
+        params_layout.addRow("Seed:", self.seed_input)
+
+        self.stop_sequences_input = QLineEdit()
+        self.stop_sequences_input.setPlaceholderText("Optional; separate multiple stops with \\n")
+        self.stop_sequences_input.setToolTip("Stop sequence list. Type \\n between sequences for multiple stops.")
+        self.stop_sequences_input.setStyleSheet(self.llama_path_input.styleSheet())
+        params_layout.addRow("Stop Sequences:", self.stop_sequences_input)
+
+        self.api_extra_body_input = QLineEdit()
+        self.api_extra_body_input.setPlaceholderText('Optional JSON, e.g. {"top_k": 40, "min_p": 0.05}')
+        self.api_extra_body_input.setToolTip("Advanced: JSON merged into OpenAI-compatible, llama-server, and HuggingFace request payloads.")
+        self.api_extra_body_input.setStyleSheet(self.llama_path_input.styleSheet())
+        params_layout.addRow("API Extra JSON:", self.api_extra_body_input)
         
         self.context_size_input = QSpinBox()
         self.context_size_input.setStyleSheet("""
@@ -701,6 +769,15 @@ class SettingsDialog(QDialog):
         self.openai_model_input.setText(self.config.get("openai_model", "gpt-3.5-turbo"))
         self.max_tokens_input.setValue(self.config.get("max_tokens", 512))
         self.temperature_input.setValue(self.config.get("temperature", 0.7))
+        self.top_p_input.setValue(self.config.get("top_p", 1.0))
+        self.top_k_input.setValue(self.config.get("top_k", 0))
+        self.min_p_input.setValue(self.config.get("min_p", 0.0))
+        self.repeat_penalty_input.setValue(self.config.get("repeat_penalty", 1.0))
+        self.presence_penalty_input.setValue(self.config.get("presence_penalty", 0.0))
+        self.frequency_penalty_input.setValue(self.config.get("frequency_penalty", 0.0))
+        self.seed_input.setValue(self.config.get("seed", -1))
+        self.stop_sequences_input.setText(self.config.get("stop_sequences", ""))
+        self.api_extra_body_input.setText(self.config.get("api_extra_body", ""))
         self.context_size_input.setValue(self.config.get("context_size", 2048))
         self.threads_input.setValue(self.config.get("threads", 4))
         self.timeout_input.setValue(self.config.get("inference_timeout", 300))
@@ -942,6 +1019,25 @@ class SettingsDialog(QDialog):
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     return False
+
+        extra_json = self.api_extra_body_input.text().strip()
+        if extra_json:
+            try:
+                parsed_extra = json.loads(extra_json)
+            except json.JSONDecodeError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Settings",
+                    f"API Extra JSON could not be parsed:\n{exc}"
+                )
+                return False
+            if not isinstance(parsed_extra, dict):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Settings",
+                    "API Extra JSON must be a JSON object."
+                )
+                return False
         
         return True
     
@@ -966,6 +1062,15 @@ class SettingsDialog(QDialog):
         self.config.set("openai_model", self.openai_model_input.text().strip())
         self.config.set("max_tokens", self.max_tokens_input.value())
         self.config.set("temperature", self.temperature_input.value())
+        self.config.set("top_p", self.top_p_input.value())
+        self.config.set("top_k", self.top_k_input.value())
+        self.config.set("min_p", self.min_p_input.value())
+        self.config.set("repeat_penalty", self.repeat_penalty_input.value())
+        self.config.set("presence_penalty", self.presence_penalty_input.value())
+        self.config.set("frequency_penalty", self.frequency_penalty_input.value())
+        self.config.set("seed", self.seed_input.value())
+        self.config.set("stop_sequences", self.stop_sequences_input.text().strip())
+        self.config.set("api_extra_body", self.api_extra_body_input.text().strip())
         self.config.set("context_size", self.context_size_input.value())
         self.config.set("threads", self.threads_input.value())
         self.config.set("inference_timeout", self.timeout_input.value())

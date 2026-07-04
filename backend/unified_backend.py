@@ -203,6 +203,144 @@ class UnifiedBackend:
             result = default
         return max(min_value, min(max_value, result))
 
+    def _config_float(self, key: str, default: float) -> float:
+        try:
+            return float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _config_int(self, key: str, default: int) -> int:
+        try:
+            return int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _stop_sequences(self) -> list:
+        raw = str(self.config.get("stop_sequences", "") or "").strip()
+        if not raw:
+            return []
+        raw = raw.replace("\\n", "\n")
+        return [line for line in (part.strip() for part in raw.splitlines()) if line]
+
+    def _api_extra_body(self) -> dict:
+        raw = str(self.config.get("api_extra_body", "") or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @classmethod
+    def _deep_merge_dicts(cls, base: dict, extra: dict) -> dict:
+        merged = dict(base or {})
+        for key, value in (extra or {}).items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = cls._deep_merge_dicts(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _openai_request_extras(self) -> dict:
+        extras = {}
+        top_p = self._config_float("top_p", 1.0)
+        if 0.0 < top_p <= 1.0:
+            extras["top_p"] = top_p
+
+        presence_penalty = self._config_float("presence_penalty", 0.0)
+        if presence_penalty != 0.0:
+            extras["presence_penalty"] = presence_penalty
+
+        frequency_penalty = self._config_float("frequency_penalty", 0.0)
+        if frequency_penalty != 0.0:
+            extras["frequency_penalty"] = frequency_penalty
+
+        seed = self._config_int("seed", -1)
+        if seed >= 0:
+            extras["seed"] = seed
+
+        stop = self._stop_sequences()
+        if stop:
+            extras["stop"] = stop[0] if len(stop) == 1 else stop
+        return extras
+
+    def _llama_server_request_extras(self) -> dict:
+        extras = self._openai_request_extras()
+        top_k = self._config_int("top_k", 0)
+        if top_k > 0:
+            extras["top_k"] = top_k
+
+        min_p = self._config_float("min_p", 0.0)
+        if min_p > 0.0:
+            extras["min_p"] = min_p
+
+        repeat_penalty = self._config_float("repeat_penalty", 1.0)
+        if repeat_penalty != 1.0:
+            extras["repeat_penalty"] = repeat_penalty
+        return extras
+
+    def _ollama_options(self, max_tokens: int, temperature: float) -> dict:
+        options = {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        }
+
+        top_p = self._config_float("top_p", 1.0)
+        if 0.0 < top_p <= 1.0:
+            options["top_p"] = top_p
+
+        top_k = self._config_int("top_k", 0)
+        if top_k > 0:
+            options["top_k"] = top_k
+
+        min_p = self._config_float("min_p", 0.0)
+        if min_p > 0.0:
+            options["min_p"] = min_p
+
+        repeat_penalty = self._config_float("repeat_penalty", 1.0)
+        if repeat_penalty != 1.0:
+            options["repeat_penalty"] = repeat_penalty
+
+        seed = self._config_int("seed", -1)
+        if seed >= 0:
+            options["seed"] = seed
+
+        stop = self._stop_sequences()
+        if stop:
+            options["stop"] = stop
+
+        return options
+
+    def _hf_parameters(self, max_tokens: int, temperature: float) -> dict:
+        parameters = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "return_full_text": False,
+        }
+
+        top_p = self._config_float("top_p", 1.0)
+        if 0.0 < top_p <= 1.0:
+            parameters["top_p"] = top_p
+
+        top_k = self._config_int("top_k", 0)
+        if top_k > 0:
+            parameters["top_k"] = top_k
+
+        repeat_penalty = self._config_float("repeat_penalty", 1.0)
+        if repeat_penalty != 1.0:
+            parameters["repetition_penalty"] = repeat_penalty
+
+        seed = self._config_int("seed", -1)
+        if seed >= 0:
+            parameters["seed"] = seed
+
+        stop = self._stop_sequences()
+        if stop:
+            parameters["stop"] = stop
+
+        return parameters
+
     @staticmethod
     def _internet_tool_spec() -> dict:
         return {
@@ -1069,17 +1207,20 @@ class UnifiedBackend:
 
         for _ in range(max_rounds):
             try:
+                payload = {
+                    "messages": resolved_messages,
+                    "stream": False,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "tools": tool_spec,
+                    "tool_choice": "auto",
+                }
+                payload.update(self._llama_server_request_extras())
+                payload = self._deep_merge_dicts(payload, self._api_extra_body())
                 response = requests.post(
                     self._llama_server_chat_url(self.llama_server_url),
                     headers=self._llama_server_headers(self.llama_server_api_key),
-                    json={
-                        "messages": resolved_messages,
-                        "stream": False,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "tools": tool_spec,
-                        "tool_choice": "auto",
-                    },
+                    json=payload,
                     timeout=self.inference_timeout,
                 )
                 response.raise_for_status()
@@ -1158,18 +1299,21 @@ class UnifiedBackend:
 
         for _ in range(max_rounds):
             try:
+                payload = {
+                    "model": self.openai_model,
+                    "messages": resolved_messages,
+                    "stream": False,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "tools": tool_spec,
+                    "tool_choice": "auto",
+                }
+                payload.update(self._openai_request_extras())
+                payload = self._deep_merge_dicts(payload, self._api_extra_body())
                 response = requests.post(
                     self._openai_compatible_chat_url(self.openai_base_url),
                     headers=self._openai_compatible_headers(self.openai_api_key),
-                    json={
-                        "model": self.openai_model,
-                        "messages": resolved_messages,
-                        "stream": False,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                        "tools": tool_spec,
-                        "tool_choice": "auto",
-                    },
+                    json=payload,
                     timeout=self.inference_timeout,
                 )
                 response.raise_for_status()
@@ -1246,19 +1390,17 @@ class UnifiedBackend:
         web_sources = []
 
         for _ in range(max_rounds):
+            payload = {
+                "model": target['request_model'],
+                "messages": resolved_messages,
+                "stream": False,
+                "tools": tool_spec,
+                "options": self._ollama_options(max_tokens, temperature),
+            }
             response = requests.post(
                 self._ollama_api_url(target['base_url'], 'chat'),
                 headers=target['headers'],
-                json={
-                    "model": target['request_model'],
-                    "messages": resolved_messages,
-                    "stream": False,
-                    "tools": tool_spec,
-                    "options": {
-                        "num_predict": max_tokens,
-                        "temperature": temperature,
-                    },
-                },
+                json=payload,
                 timeout=self.inference_timeout,
             )
             response.raise_for_status()
@@ -1526,6 +1668,8 @@ class UnifiedBackend:
                 "temperature": temperature,
                 "stream_options": {"include_usage": True},
             }
+            payload.update(self._llama_server_request_extras())
+            payload = self._deep_merge_dicts(payload, self._api_extra_body())
 
             response = requests.post(
                 self._llama_server_chat_url(self.llama_server_url),

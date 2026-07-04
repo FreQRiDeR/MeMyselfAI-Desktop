@@ -44,6 +44,15 @@ class Config:
         "default_model": "",
         "max_tokens": 512,
         "temperature": 0.7,
+        "top_p": 1.0,
+        "top_k": 0,                    # 0 = provider default / disabled
+        "min_p": 0.0,                  # 0 = provider default / disabled
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "seed": -1,                    # -1 = provider default / random
+        "stop_sequences": "",          # one sequence per line
+        "api_extra_body": "",          # advanced JSON merged into API request payloads
         "context_size": 2048,
         "threads": 4,
         # llama.cpp local backend tuning
