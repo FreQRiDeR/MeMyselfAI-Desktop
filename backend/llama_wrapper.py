@@ -65,6 +65,12 @@ class LlamaWrapper:
         self.extra_args = str(tuning.get("llama_extra_args", "")).strip()
         self.request_timeout = _cfg_int("inference_timeout", 300, min_value=30, max_value=3600)
 
+        # Split user-supplied extra args into environment variables (KEY=VALUE)
+        # and command-line flags. Anything tokenized as KEY=VALUE where KEY looks
+        # like a valid environment variable name is treated as an env var; the
+        # rest are appended to the llama-server command line.
+        self.extra_env, self.extra_flags = self._parse_extra_args(self.extra_args)
+
         if self.ubatch_size > self.batch_size:
             self.ubatch_size = self.batch_size
 
@@ -177,6 +183,42 @@ class LlamaWrapper:
         if not self.llama_cpp_path.exists():
             raise FileNotFoundError(f"llama-server not found at: {self.llama_cpp_path}")
     
+    @staticmethod
+    def _parse_extra_args(extra_args: str):
+        """
+        Split a user-supplied extra-args string into environment variables and
+        command-line flags.
+
+        Tokens of the form ``KEY=VALUE`` (where KEY matches a typical
+        environment variable name: ``[A-Za-z_][A-Za-z0-9_]*``) are treated as
+        environment variables. Everything else is treated as a command-line
+        flag and returned verbatim (already tokenized with shlex).
+
+        Returns:
+            (env_dict, flags_list)
+        """
+        env_vars = {}
+        flags = []
+        if not extra_args:
+            return env_vars, flags
+
+        try:
+            tokens = shlex.split(extra_args)
+        except ValueError as exc:
+            print(f"⚠️  [LlamaWrapper] Ignoring invalid extra args: {exc}")
+            return env_vars, flags
+
+        env_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+        for token in tokens:
+            if env_pattern.match(token):
+                key, _, value = token.partition("=")
+                key = key.strip()
+                if key:
+                    env_vars[key] = value
+            else:
+                flags.append(token)
+        return env_vars, flags
+
     def check_model_file(self, model_path: str) -> bool:
         """Check if model file exists and is readable"""
         path = Path(model_path)
@@ -208,11 +250,10 @@ class LlamaWrapper:
             cmd.extend(['--numa', self.numa_mode])
 
         # Keep port/host arguments last and controlled by wrapper.
-        if self.extra_args:
-            try:
-                cmd.extend(shlex.split(self.extra_args))
-            except ValueError as exc:
-                print(f"⚠️  [LlamaWrapper #{self.instance_id}] Ignoring invalid extra args: {exc}")
+        # Note: env vars (KEY=VALUE) were already separated out in __init__
+        # via _parse_extra_args; only command-line flags are appended here.
+        if self.extra_flags:
+            cmd.extend(self.extra_flags)
 
         cmd.extend([
             '--port', str(self.server_port),
@@ -236,8 +277,12 @@ class LlamaWrapper:
             env["DYLD_LIBRARY_PATH"] = (
                 f"{binary_dir}{os.pathsep}{existing}" if existing else binary_dir
             )
-            # Only relevant on macOS builds with Metal support.
-            env.setdefault("GGML_METAL_FULL_OFFLOAD", "0")
+
+        # Apply user-supplied environment variables from the extra-args input.
+        # These take precedence over any hardcoded defaults above.
+        if self.extra_env:
+            for key, value in self.extra_env.items():
+                env[key] = value
 
         return env
     
@@ -286,6 +331,10 @@ class LlamaWrapper:
         
         launch_env = self._build_server_env()
         try:
+            print("launch_env:")
+            for k, v in launch_env.items():
+                if k.startswith("GGML_"):
+                    print(f"  {k}={v}")
             self.server_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

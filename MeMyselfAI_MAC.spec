@@ -96,6 +96,14 @@ if Path(ollama_binary_path).exists():
 else:
     print(f"⚠️  WARNING: ollama not found at: {ollama_binary_path}")
 
+# Include default.metallib for Metal GPU acceleration on macOS
+metallib_path = 'backend/bin/macos/default.metallib'
+if Path(metallib_path).exists():
+    binaries.append((metallib_path, 'backend/bin'))
+    print(f"✅ Found default.metallib at: {metallib_path}")
+else:
+    print(f"⚠️  WARNING: default.metallib not found at: {metallib_path}")
+
 # Collect networking deps used by requests, including optional charset/chardet backends.
 extra_datas = []
 extra_binaries = []

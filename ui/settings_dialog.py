@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from pathlib import Path
+import re
 import shlex
 
 
@@ -537,10 +538,17 @@ class SettingsDialog(QDialog):
         tuning_layout.addRow("Polling (--poll):", self.llama_poll_input)
 
         self.llama_extra_args_input = QLineEdit()
-        self.llama_extra_args_input.setPlaceholderText("Optional extra flags, e.g. --fit off --cache-type-k q8_0")
-        self.llama_extra_args_input.setToolTip("Appended to llama-server command (advanced)")
+        self.llama_extra_args_input.setPlaceholderText(
+            "Extra flags and/or env vars, e.g. --fit off GGML_METAL_VRAM_RESERVE_MB=1024"
+        )
+        self.llama_extra_args_input.setToolTip(
+            "Appended to the llama-server launch. Tokens of the form KEY=VALUE "
+            "(where KEY looks like an environment variable name) are applied as "
+            "environment variables to the server process; all other tokens are "
+            "appended as command-line flags (advanced)."
+        )
         self.llama_extra_args_input.setStyleSheet(self.llama_gpu_layers_input.styleSheet())
-        tuning_layout.addRow("Extra Args:", self.llama_extra_args_input)
+        tuning_layout.addRow("Extra Args / Env Vars:", self.llama_extra_args_input)
 
         tuning_note = QLabel("Tip: Context Size (-c) and Threads (-t) are in Generation Parameters above.")
         tuning_note.setStyleSheet("color: #999; font-size: 11px;")
@@ -810,7 +818,7 @@ class SettingsDialog(QDialog):
 
             if extra_args:
                 try:
-                    shlex.split(extra_args)
+                    tokens = shlex.split(extra_args)
                 except ValueError as exc:
                     QMessageBox.warning(
                         self,
@@ -818,6 +826,19 @@ class SettingsDialog(QDialog):
                         f"Extra Args could not be parsed:\n{exc}"
                     )
                     return False
+
+                # Validate KEY=VALUE env-var tokens have a non-empty key.
+                env_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+                for token in tokens:
+                    if "=" in token and env_pattern.match(token):
+                        key = token.split("=", 1)[0].strip()
+                        if not key:
+                            QMessageBox.warning(
+                                self,
+                                "Invalid Settings",
+                                f"Environment variable has an empty name:\n{token}"
+                            )
+                            return False
         
         elif backend == "llama_server":
             llama_server_url = self.llama_server_url_input.text().strip()
