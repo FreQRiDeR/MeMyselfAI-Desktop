@@ -76,6 +76,7 @@ class SettingsDialog(QDialog):
         self.backend_combo.addItem("Remote SERVER (HTTP + SSE)", "llama_server")
         self.backend_combo.addItem("Ollama (Local API)", "ollama")
         self.backend_combo.addItem("HuggingFace (Cloud)", "huggingface")
+        self.backend_combo.addItem("OpenAI Compatible", "openai_compatible")
         self.backend_combo.currentIndexChanged.connect(self.on_backend_changed)
         paths_layout.addRow("Backend:", self.backend_combo)
         
@@ -217,6 +218,26 @@ class SettingsDialog(QDialog):
             }
         """)
         paths_layout.addRow(self.hf_label, self.hf_api_key_input)
+
+        # OpenAI-compatible API settings
+        self.openai_base_url_label = QLabel("Base URL:")
+        self.openai_base_url_input = QLineEdit()
+        self.openai_base_url_input.setPlaceholderText("https://api.openai.com/v1")
+        self.openai_base_url_input.setStyleSheet(self.hf_api_key_input.styleSheet())
+        paths_layout.addRow(self.openai_base_url_label, self.openai_base_url_input)
+
+        self.openai_api_key_label = QLabel("API Key:")
+        self.openai_api_key_input = QLineEdit()
+        self.openai_api_key_input.setPlaceholderText("Optional for local compatible servers")
+        self.openai_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.openai_api_key_input.setStyleSheet(self.hf_api_key_input.styleSheet())
+        paths_layout.addRow(self.openai_api_key_label, self.openai_api_key_input)
+
+        self.openai_model_label = QLabel("Model:")
+        self.openai_model_input = QLineEdit()
+        self.openai_model_input.setPlaceholderText("gpt-4o-mini")
+        self.openai_model_input.setStyleSheet(self.hf_api_key_input.styleSheet())
+        paths_layout.addRow(self.openai_model_label, self.openai_model_input)
         
         # Add note about models
         models_note = QLabel("💡 Models are managed via File → Manage Models")
@@ -675,6 +696,9 @@ class SettingsDialog(QDialog):
         self.ollama_url_input.setText(self.config.get("ollama_url", "http://localhost:11434"))
         self.ollama_api_key_input.setText(self.config.get("ollama_api_key", ""))
         self.hf_api_key_input.setText(self.config.get("hf_api_key", ""))
+        self.openai_base_url_input.setText(self.config.get("openai_base_url", "https://api.openai.com/v1"))
+        self.openai_api_key_input.setText(self.config.get("openai_api_key", ""))
+        self.openai_model_input.setText(self.config.get("openai_model", "gpt-3.5-turbo"))
         self.max_tokens_input.setValue(self.config.get("max_tokens", 512))
         self.temperature_input.setValue(self.config.get("temperature", 0.7))
         self.context_size_input.setValue(self.config.get("context_size", 2048))
@@ -724,6 +748,7 @@ class SettingsDialog(QDialog):
         is_llama_server = backend == "llama_server"
         is_ollama = backend == "ollama"
         is_hf = backend == "huggingface"
+        is_openai_compatible = backend == "openai_compatible"
 
         # Show/hide llama.cpp fields
         self.llama_label.setVisible(is_local)
@@ -749,6 +774,14 @@ class SettingsDialog(QDialog):
         # Show/hide HuggingFace fields
         self.hf_label.setVisible(is_hf)
         self.hf_api_key_input.setVisible(is_hf)
+
+        # Show/hide OpenAI-compatible fields
+        self.openai_base_url_label.setVisible(is_openai_compatible)
+        self.openai_base_url_input.setVisible(is_openai_compatible)
+        self.openai_api_key_label.setVisible(is_openai_compatible)
+        self.openai_api_key_input.setVisible(is_openai_compatible)
+        self.openai_model_label.setVisible(is_openai_compatible)
+        self.openai_model_input.setVisible(is_openai_compatible)
 
     def browse_ollama_path(self):
         """Browse for Ollama binary"""
@@ -886,6 +919,29 @@ class SettingsDialog(QDialog):
             if not api_key.startswith('hf_'):
                 QMessageBox.warning(self, "Invalid Settings", "HuggingFace API keys should start with 'hf_'")
                 return False
+
+        elif backend == "openai_compatible":
+            base_url = self.openai_base_url_input.text().strip()
+            model = self.openai_model_input.text().strip()
+            if not base_url:
+                QMessageBox.warning(self, "Invalid Settings", "Please specify Base URL")
+                return False
+            if not model:
+                QMessageBox.warning(self, "Invalid Settings", "Please specify Model")
+                return False
+
+            from backend.unified_backend import UnifiedBackend
+            if not UnifiedBackend.test_openai_compatible_connection(
+                base_url, self.openai_api_key_input.text().strip()
+            ):
+                reply = QMessageBox.question(
+                    self,
+                    "Provider Not Reachable",
+                    f"Cannot connect to OpenAI-compatible provider at {base_url}\n\nSave anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return False
         
         return True
     
@@ -905,6 +961,9 @@ class SettingsDialog(QDialog):
         self.config.set("ollama_url", self.ollama_url_input.text().strip())
         self.config.set("ollama_api_key", self.ollama_api_key_input.text().strip())
         self.config.set("hf_api_key", self.hf_api_key_input.text().strip())
+        self.config.set("openai_base_url", self.openai_base_url_input.text().strip())
+        self.config.set("openai_api_key", self.openai_api_key_input.text().strip())
+        self.config.set("openai_model", self.openai_model_input.text().strip())
         self.config.set("max_tokens", self.max_tokens_input.value())
         self.config.set("temperature", self.temperature_input.value())
         self.config.set("context_size", self.context_size_input.value())

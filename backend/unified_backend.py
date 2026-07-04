@@ -1,6 +1,7 @@
 """
 unified_backend.py
-Unified backend supporting local llama.cpp, remote llama-server, Ollama, and HuggingFace
+Unified backend supporting local llama.cpp, remote llama-server, Ollama,
+HuggingFace, and OpenAI-compatible chat completion APIs.
 """
 
 import sys
@@ -25,6 +26,7 @@ class BackendType(Enum):
     LLAMA_SERVER = "llama_server"  # HTTP + SSE
     OLLAMA = "ollama"         # Ollama API (local or remote)
     HUGGINGFACE = "huggingface"  # HuggingFace Inference API
+    OPENAI_COMPATIBLE = "openai_compatible"  # OpenAI-compatible /v1/chat/completions
 
 
 class UnifiedBackend:
@@ -43,6 +45,7 @@ class UnifiedBackend:
                 For LLAMA_SERVER: llama_server_url, llama_server_api_key
                 For OLLAMA: ollama_url (default: http://localhost:11434), ollama_path
                 For HUGGINGFACE: api_key
+                For OPENAI_COMPATIBLE: openai_base_url, openai_api_key, openai_model
         """
         self.backend_type = backend_type
         self.config = config
@@ -70,6 +73,15 @@ class UnifiedBackend:
             self.hf_api_key = config.get('api_key')
             if not self.hf_api_key:
                 raise ValueError("HuggingFace API key required")
+        elif backend_type == BackendType.OPENAI_COMPATIBLE:
+            self.openai_base_url = config.get('openai_base_url', 'https://api.openai.com/v1')
+            self.openai_api_key = str(config.get('openai_api_key', '')).strip()
+            self.openai_model = str(config.get('openai_model', '')).strip()
+            self.openai_tool_protocol_supported = None
+            if not self.openai_base_url:
+                raise ValueError("OpenAI-compatible base URL required")
+            if not self.openai_model:
+                raise ValueError("OpenAI-compatible model required")
 
     @staticmethod
     def _ollama_headers(api_key: str = "") -> dict:
@@ -94,6 +106,29 @@ class UnifiedBackend:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
+
+    @staticmethod
+    def _openai_compatible_headers(api_key: str = "") -> dict:
+        headers = {}
+        api_key = str(api_key).strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    @classmethod
+    def _openai_compatible_base_url(cls, base_url: str) -> str:
+        base = str(base_url).strip().rstrip('/')
+        for suffix in ('/chat/completions', '/completions'):
+            if base.endswith(suffix):
+                return base[:-len(suffix)].rstrip('/')
+        return base
+
+    @classmethod
+    def _openai_compatible_chat_url(cls, base_url: str) -> str:
+        base = cls._openai_compatible_base_url(base_url)
+        if base.endswith('/v1'):
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"
 
     @classmethod
     def _llama_server_base_url(cls, base_url: str) -> str:
@@ -1106,6 +1141,97 @@ class UnifiedBackend:
             )
         return resolved_messages, web_results_used, web_sources
 
+    def _resolve_openai_compatible_internet_tools(
+        self,
+        chat_messages: list,
+        max_tokens: int,
+        temperature: float,
+        max_rounds: int = 3,
+    ) -> tuple:
+        resolved_messages = list(chat_messages)
+        tool_spec = [self._internet_tool_spec()]
+        web_results_used = 0
+        web_sources = []
+
+        if getattr(self, "openai_tool_protocol_supported", None) is False:
+            return resolved_messages, web_results_used, web_sources
+
+        for _ in range(max_rounds):
+            try:
+                response = requests.post(
+                    self._openai_compatible_chat_url(self.openai_base_url),
+                    headers=self._openai_compatible_headers(self.openai_api_key),
+                    json={
+                        "model": self.openai_model,
+                        "messages": resolved_messages,
+                        "stream": False,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "tools": tool_spec,
+                        "tool_choice": "auto",
+                    },
+                    timeout=self.inference_timeout,
+                )
+                response.raise_for_status()
+                self.openai_tool_protocol_supported = True
+            except requests.RequestException as exc:
+                if self._is_tool_protocol_fallback_error(exc):
+                    self.openai_tool_protocol_supported = False
+                    print(
+                        "⚠️  OpenAI-compatible endpoint rejected tool-calling payload; "
+                        "falling back to non-tool generation."
+                    )
+                    break
+                raise
+
+            payload = response.json()
+            choices = payload.get("choices") or []
+            if not choices:
+                break
+
+            message = choices[0].get("message") or {}
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                tool_calls = self._extract_text_tool_calls(message.get("content", ""))
+            if not tool_calls:
+                break
+
+            assistant_message = {
+                "role": "assistant",
+                "content": message.get("content", ""),
+                "tool_calls": tool_calls,
+            }
+            resolved_messages.append(assistant_message)
+
+            for call in tool_calls:
+                function_payload = call.get("function") or {}
+                tool_name = function_payload.get("name")
+                tool_args = self._parse_tool_arguments(function_payload.get("arguments"))
+
+                if tool_name == "internet_search":
+                    tool_result = self._run_internet_tool(tool_args)
+                    web_sources = self._merge_web_sources(web_sources, tool_result, limit=5)
+                    if (tool_result.get("results") or []):
+                        web_results_used += 1
+                else:
+                    tool_result = {"error": f"Unsupported tool: {tool_name}"}
+
+                tool_message = {
+                    "role": "tool",
+                    "name": tool_name or "internet_search",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+                tool_call_id = call.get("id")
+                if tool_call_id:
+                    tool_message["tool_call_id"] = tool_call_id
+                resolved_messages.append(tool_message)
+
+        if web_results_used > 0:
+            resolved_messages.append(
+                {"role": "system", "content": self._force_final_answer_instruction()}
+            )
+        return resolved_messages, web_results_used, web_sources
+
     def _resolve_ollama_internet_tools(
         self,
         target: dict,
@@ -1271,6 +1397,10 @@ class UnifiedBackend:
             )
         elif self.backend_type == BackendType.HUGGINGFACE:
             yield from self._hf_generate(model, prompt, max_tokens, temperature, callback)
+        elif self.backend_type == BackendType.OPENAI_COMPATIBLE:
+            yield from self._openai_compatible_generate(
+                model, prompt, max_tokens, temperature, callback, messages, internet_enabled
+            )
     
     def _local_generate(
         self,
@@ -1642,6 +1772,166 @@ class UnifiedBackend:
                 except Exception:
                     pass
                 self._active_response = None
+
+    def _openai_compatible_generate(
+        self,
+        model: str,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        callback: Optional[Callable[[str], None]],
+        messages: list = None,
+        internet_enabled: bool = False,
+    ) -> Generator[str, None, None]:
+        """Generate using an OpenAI-compatible /v1/chat/completions endpoint."""
+        try:
+            request_start = time.time()
+            first_token_time = None
+            full_response = ""
+            stream_usage = None
+            web_results_used = 0
+            web_sources = []
+            request_model = str(model or self.openai_model).strip() or self.openai_model
+
+            chat_messages = messages if messages else [{"role": "user", "content": prompt}]
+            if internet_enabled:
+                chat_messages, web_results_used, web_sources = self._resolve_openai_compatible_internet_tools(
+                    chat_messages, max_tokens=max_tokens, temperature=temperature
+                )
+            chat_messages, web_results_used, web_sources = self._apply_forced_web_context_if_needed(
+                chat_messages,
+                prompt=prompt,
+                internet_enabled=internet_enabled,
+                web_results_used=web_results_used,
+                web_sources=web_sources,
+            )
+            latest_query = self._latest_user_query(chat_messages, prompt=prompt)
+            if (
+                internet_enabled
+                and web_results_used > 0
+                and self._is_time_sensitive_numeric_query(latest_query)
+                and self._is_low_confidence_web_sources(web_sources)
+            ):
+                guarded_text = self._build_limited_verification_response(latest_query, web_sources)
+                if callback:
+                    callback(guarded_text)
+                yield guarded_text
+                self.last_generation_stats = {
+                    "prompt_tps": None,
+                    "generation_tps": None,
+                    "prompt_tokens": max(1, sum(self._message_content_length(m.get("content", "")) for m in chat_messages) // 4),
+                    "completion_tokens": max(1, len(guarded_text) // 4),
+                    "web_results_used": web_results_used,
+                    "web_sources": web_sources[:5],
+                }
+                return
+
+            response = requests.post(
+                self._openai_compatible_chat_url(self.openai_base_url),
+                headers=self._openai_compatible_headers(self.openai_api_key),
+                json={
+                    "model": request_model,
+                    "messages": chat_messages,
+                    "stream": True,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                stream=True,
+                timeout=self.inference_timeout,
+            )
+            self._active_response = response
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode('utf-8') if isinstance(line, bytes) else str(line)
+                if not line_str.startswith('data: '):
+                    continue
+
+                data_str = line_str[6:].strip()
+                if data_str == '[DONE]':
+                    break
+
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if isinstance(chunk, dict) and "usage" in chunk:
+                    stream_usage = chunk.get("usage") or stream_usage
+
+                choices = chunk.get('choices') or []
+                if not choices:
+                    continue
+
+                delta = choices[0].get('delta', {})
+                content = delta.get('content', '')
+                if isinstance(content, list):
+                    content = ''.join(
+                        part.get('text', '') if isinstance(part, dict) else str(part)
+                        for part in content
+                    )
+                if not content:
+                    continue
+
+                if first_token_time is None:
+                    first_token_time = time.time()
+                full_response += content
+                if callback:
+                    callback(content)
+                yield content
+
+            request_end = time.time()
+            if first_token_time is not None:
+                prompt_seconds = max(1e-9, first_token_time - request_start)
+                generation_seconds = max(1e-9, request_end - first_token_time)
+            else:
+                prompt_seconds = max(1e-9, request_end - request_start)
+                generation_seconds = None
+
+            prompt_tokens = None
+            completion_tokens = None
+            if isinstance(stream_usage, dict):
+                prompt_tokens = stream_usage.get("prompt_tokens")
+                completion_tokens = stream_usage.get("completion_tokens")
+
+            if prompt_tokens is None:
+                prompt_chars = sum(
+                    self._message_content_length(m.get("content", "")) for m in chat_messages
+                )
+                prompt_tokens = max(1, prompt_chars // 4)
+            if completion_tokens is None:
+                completion_tokens = max(1, len(full_response) // 4)
+
+            prompt_tps = prompt_tokens / prompt_seconds if prompt_seconds and prompt_tokens else None
+            generation_tps = (
+                completion_tokens / generation_seconds
+                if generation_seconds and completion_tokens else None
+            )
+
+            self.last_generation_stats = {
+                "prompt_tps": prompt_tps,
+                "generation_tps": generation_tps,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "web_results_used": web_results_used,
+                "web_sources": web_sources,
+            }
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code == 401:
+                raise RuntimeError("OpenAI-compatible API error: 401 Unauthorized.")
+            raise RuntimeError(f"OpenAI-compatible API error: {e}")
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"OpenAI-compatible API error: {e}")
+        finally:
+            if self._active_response is not None:
+                try:
+                    self._active_response.close()
+                except Exception:
+                    pass
+                self._active_response = None
     
     def _hf_generate(
         self,
@@ -1729,7 +2019,7 @@ class UnifiedBackend:
         if self.backend_type == BackendType.LOCAL and hasattr(self, "local_wrapper"):
             if hasattr(self.local_wrapper, "get_last_generation_stats"):
                 return self.local_wrapper.get_last_generation_stats()
-        if self.backend_type in {BackendType.LLAMA_SERVER, BackendType.OLLAMA}:
+        if self.backend_type in {BackendType.LLAMA_SERVER, BackendType.OLLAMA, BackendType.OPENAI_COMPATIBLE}:
             return dict(self.last_generation_stats)
         return {}
     
@@ -1737,7 +2027,7 @@ class UnifiedBackend:
         """Stop current generation"""
         if self.backend_type == BackendType.LOCAL:
             self.local_wrapper.stop_generation()
-        elif self.backend_type in {BackendType.LLAMA_SERVER, BackendType.OLLAMA}:
+        elif self.backend_type in {BackendType.LLAMA_SERVER, BackendType.OLLAMA, BackendType.OPENAI_COMPATIBLE}:
             if self._active_response is not None:
                 try:
                     self._active_response.close()
@@ -1821,6 +2111,19 @@ class UnifiedBackend:
                 timeout=2,
             )
             return response.status_code in {200, 401}
+        except Exception:
+            return False
+
+    @staticmethod
+    def test_openai_compatible_connection(base_url: str = 'https://api.openai.com/v1', api_key: str = '') -> bool:
+        """Test if an OpenAI-compatible endpoint is reachable."""
+        try:
+            response = requests.get(
+                f"{UnifiedBackend._openai_compatible_base_url(base_url)}/models",
+                headers=UnifiedBackend._openai_compatible_headers(api_key),
+                timeout=5,
+            )
+            return response.status_code in {200, 401, 403, 404}
         except Exception:
             return False
     

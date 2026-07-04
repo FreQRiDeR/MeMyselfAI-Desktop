@@ -24,10 +24,13 @@ class Config:
         "remote sse": "llama_server",
         "ollama": "ollama",
         "huggingface": "huggingface",
+        "openai_compatible": "openai_compatible",
+        "openai": "openai_compatible",
+        "openai compatible": "openai_compatible",
     }
     
     DEFAULT_CONFIG = {
-        "backend_type": "local",  # local, llama_server, ollama, or huggingface
+        "backend_type": "local",  # local, llama_server, ollama, huggingface, or openai_compatible
         "llama_cpp_path": "bundled" if _is_bundled else "",
         "llama_server_url": "http://localhost:8080",
         "llama_server_api_key": "",
@@ -35,6 +38,9 @@ class Config:
         "ollama_url": "http://localhost:11434",
         "ollama_api_key": "",
         "hf_api_key": "",
+        "openai_base_url": "https://api.openai.com/v1",
+        "openai_api_key": "",
+        "openai_model": "gpt-3.5-turbo",
         "default_model": "",
         "max_tokens": 512,
         "temperature": 0.7,
@@ -152,7 +158,7 @@ class Config:
     
     def is_configured(self) -> bool:
         """Check if app is properly configured"""
-        # For local backend, need llama.cpp path; for remote llama-server, need URL; for Ollama, need Ollama path
+        # For local backend, need llama.cpp path; remote/API backends need their endpoint details.
         backend_type = self.config.get("backend_type", "local")
         if backend_type == "local":
             return self.get_llama_cpp_path() is not None
@@ -160,6 +166,11 @@ class Config:
             return bool(str(self.config.get("llama_server_url", "")).strip())
         elif backend_type == "ollama":
             return self.get_ollama_path() is not None
+        elif backend_type == "openai_compatible":
+            return (
+                bool(str(self.config.get("openai_base_url", "")).strip())
+                and bool(str(self.config.get("openai_model", "")).strip())
+            )
         else:  # huggingface
             return True  # Only need API key
 

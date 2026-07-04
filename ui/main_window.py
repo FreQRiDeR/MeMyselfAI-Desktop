@@ -696,6 +696,14 @@ class MainWindow(QMainWindow):
                 self.config.get("hf_api_key", ""),
                 self.config.get("inference_timeout", 300),
             )
+        if backend_type_str == "openai_compatible":
+            return (
+                "openai_compatible",
+                self.config.get("openai_base_url", "https://api.openai.com/v1"),
+                self.config.get("openai_api_key", ""),
+                self.config.get("openai_model", "gpt-3.5-turbo"),
+                self.config.get("inference_timeout", 300),
+            )
         return ("unknown",)
 
     def load_configuration(self):
@@ -723,7 +731,8 @@ class MainWindow(QMainWindow):
                 "local": BackendType.LOCAL,
                 "llama_server": BackendType.LLAMA_SERVER,
                 "ollama": BackendType.OLLAMA, 
-                "huggingface": BackendType.HUGGINGFACE
+                "huggingface": BackendType.HUGGINGFACE,
+                "openai_compatible": BackendType.OPENAI_COMPATIBLE,
             }.get(backend_type_str)
             
             if current_type != target_type:
@@ -788,6 +797,20 @@ class MainWindow(QMainWindow):
                     self.model_combo.clear()
                     self.model_combo.addItem("Enter model name (e.g. meta-llama/Llama-2-7b-chat-hf)")
 
+                elif backend_type_str == "openai_compatible":
+                    openai_base_url = self.config.get("openai_base_url", "https://api.openai.com/v1")
+                    openai_api_key = self.config.get("openai_api_key", "")
+                    openai_model = self.config.get("openai_model", "gpt-3.5-turbo")
+                    self.backend = UnifiedBackend(
+                        BackendType.OPENAI_COMPATIBLE,
+                        openai_base_url=openai_base_url,
+                        openai_api_key=openai_api_key,
+                        openai_model=openai_model,
+                        inference_timeout=self.config.get("inference_timeout", 300),
+                    )
+                    self.status_bar.showMessage(f"✅ OpenAI-compatible backend: {openai_base_url}")
+                    self.refresh_openai_compatible_model()
+
                 self._backend_signature = target_signature
 
             except Exception as e:
@@ -812,6 +835,10 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("✅ HuggingFace backend configured")
                 self.model_combo.clear()
                 self.model_combo.addItem("Enter model name (e.g. meta-llama/Llama-2-7b-chat-hf)")
+            elif backend_type_str == "openai_compatible":
+                openai_base_url = self.config.get("openai_base_url", "https://api.openai.com/v1")
+                self.status_bar.showMessage(f"✅ OpenAI-compatible backend: {openai_base_url}")
+                self.refresh_openai_compatible_model()
 
 
     def refresh_models(self):
@@ -848,6 +875,25 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Connected to remote llama-server: {endpoint_label}")
         else:
             self.status_bar.showMessage(f"⚠️  Remote llama-server not reachable: {endpoint_label}")
+
+    def refresh_openai_compatible_model(self):
+        from backend.unified_backend import UnifiedBackend
+
+        base_url = self.config.get("openai_base_url", "https://api.openai.com/v1")
+        api_key = self.config.get("openai_api_key", "")
+        model_name = self.config.get("openai_model", "gpt-3.5-turbo")
+        parsed = urlparse(base_url)
+        endpoint_label = parsed.netloc or parsed.path or base_url
+
+        self.model_combo.clear()
+        self.model_combo.addItem(f"{model_name} ({endpoint_label})", model_name)
+        self.model_combo.setCurrentIndex(0)
+        self.current_model = model_name
+
+        if UnifiedBackend.test_openai_compatible_connection(base_url, api_key):
+            self.status_bar.showMessage(f"Connected to OpenAI-compatible provider: {endpoint_label}")
+        else:
+            self.status_bar.showMessage(f"⚠️  OpenAI-compatible provider not reachable: {endpoint_label}")
 
     def refresh_ollama_models(self):
         from backend.unified_backend import UnifiedBackend
@@ -1070,7 +1116,7 @@ class MainWindow(QMainWindow):
         # Prepare prompt with file contents and optional image payloads.
         full_prompt = message if message else "Please analyze the attached files:"
         ollama_images = []
-        llama_image_urls = []
+        openai_style_image_urls = []
         attachment_sections = []
 
         if self.attached_files:
@@ -1086,9 +1132,13 @@ class MainWindow(QMainWindow):
                             attachment_sections[-1] = (
                                 f"[Image attached: {filename} (failed to load: {exc})]"
                             )
-                    elif self.backend.backend_type in {BackendType.LOCAL, BackendType.LLAMA_SERVER}:
+                    elif self.backend.backend_type in {
+                        BackendType.LOCAL,
+                        BackendType.LLAMA_SERVER,
+                        BackendType.OPENAI_COMPATIBLE,
+                    }:
                         try:
-                            llama_image_urls.append(self._image_to_data_url(filepath))
+                            openai_style_image_urls.append(self._image_to_data_url(filepath))
                         except Exception as exc:
                             attachment_sections[-1] = (
                                 f"[Image attached: {filename} (failed to load: {exc})]"
@@ -1106,7 +1156,7 @@ class MainWindow(QMainWindow):
         
         self.append_message("Assistant", "", "#34C759")
 
-        # Build full messages list for Ollama /api/chat so the model has conversation history
+        # Build full messages list so chat backends receive conversation history.
         system_prompt_text = self.prompt_manager.active.prompt
         messages = []
         if system_prompt_text:
@@ -1117,9 +1167,13 @@ class MainWindow(QMainWindow):
         user_message = {"role": "user", "content": full_prompt}
         if ollama_images and self.backend.backend_type == BackendType.OLLAMA:
             user_message["images"] = ollama_images
-        elif llama_image_urls and self.backend.backend_type in {BackendType.LOCAL, BackendType.LLAMA_SERVER}:
+        elif openai_style_image_urls and self.backend.backend_type in {
+            BackendType.LOCAL,
+            BackendType.LLAMA_SERVER,
+            BackendType.OPENAI_COMPATIBLE,
+        }:
             content_parts = [{"type": "text", "text": full_prompt}]
-            for image_url in llama_image_urls:
+            for image_url in openai_style_image_urls:
                 content_parts.append(
                     {
                         "type": "image_url",
@@ -1322,6 +1376,12 @@ class MainWindow(QMainWindow):
                 self,
                 "Remote llama-server",
                 "This backend connects to a server that already has its model loaded.\n\nUse Settings to change the remote endpoint."
+            )
+        elif backend_type == "openai_compatible":
+            QMessageBox.information(
+                self,
+                "OpenAI Compatible",
+                "This backend uses the model name configured in Settings.\n\nUse Settings to change the provider, API key, or model."
             )
         else:
             from ui.model_manager_dialog import ModelManagerDialog
