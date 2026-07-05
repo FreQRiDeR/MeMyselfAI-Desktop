@@ -12,3 +12,4 @@ wheels/
 .DS_Store
 *.lock
 *.toml
+AGENTS.md
