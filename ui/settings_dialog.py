@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QLabel, QSpinBox,
     QDoubleSpinBox, QFileDialog, QDialogButtonBox,
     QGroupBox, QMessageBox, QFontComboBox, QComboBox,
-    QCheckBox
+    QCheckBox, QScrollArea, QWidget
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -31,8 +31,20 @@ class SettingsDialog(QDialog):
         """Initialize UI"""
         self.setWindowTitle("Settings")
         self.setMinimumWidth(600)
+        self.setMinimumHeight(600)
         
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(16, 16, 16, 16)
+        scroll_layout.setSpacing(12)
         
         # Paths group
         paths_group = QGroupBox("Backend Configuration")
@@ -246,7 +258,7 @@ class SettingsDialog(QDialog):
         paths_layout.addRow("", models_note)
         
         paths_group.setLayout(paths_layout)
-        layout.addWidget(paths_group)
+        scroll_layout.addWidget(paths_group)
         
         # Generation parameters group
         params_group = QGroupBox("Generation Parameters")
@@ -532,7 +544,7 @@ class SettingsDialog(QDialog):
         params_layout.addRow("Inference Timeout:", self.timeout_input)
         
         params_group.setLayout(params_layout)
-        layout.addWidget(params_group)
+        scroll_layout.addWidget(params_group)
 
         # Local llama.cpp tuning parameters
         self.local_tuning_group = QGroupBox("Local llama.cpp Tuning")
@@ -644,7 +656,7 @@ class SettingsDialog(QDialog):
         tuning_layout.addRow("", tuning_note)
 
         self.local_tuning_group.setLayout(tuning_layout)
-        layout.addWidget(self.local_tuning_group)
+        scroll_layout.addWidget(self.local_tuning_group)
         
         # Appearance group
         appearance_group = QGroupBox("Appearance")
@@ -727,7 +739,11 @@ class SettingsDialog(QDialog):
         appearance_layout.addRow("Font Size:", self.font_size_input)
         
         appearance_group.setLayout(appearance_layout)
-        layout.addWidget(appearance_group)
+        scroll_layout.addWidget(appearance_group)
+        scroll_layout.addStretch(1)
+
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area, 1)
         
         # Buttons
         button_box = QDialogButtonBox(
