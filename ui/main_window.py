@@ -25,6 +25,8 @@ from backend.unified_backend import UnifiedBackend, BackendType
 from backend.config import Config
 from backend.chat_history import ChatHistory, Conversation
 from backend.system_prompts import SystemPromptManager
+from backend import redact as redact_module
+from backend.logger import setup_logging, get_logger
 
 
 # ─────────────────────────────────────────────
@@ -55,6 +57,7 @@ class GenerationThread(QThread):
         self.system_prompt = system_prompt
         self.messages      = messages
         self.internet_enabled = bool(internet_enabled)
+        self.log = get_logger("backend")
 
     def run(self):
         try:
@@ -76,6 +79,7 @@ class GenerationThread(QThread):
                 emit_chars = 0
                 last_emit = time.perf_counter()
 
+            self.log.info(f"Starting generation for model: {self.backend._current_model_label() if hasattr(self.backend, '_current_model_label') else self.model}")
             for token in self.backend.generate_streaming(
                 self.model, full_prompt, self.max_tokens, self.temperature,
                 messages=self.messages,
@@ -92,7 +96,9 @@ class GenerationThread(QThread):
             if hasattr(self.backend, "get_last_generation_stats"):
                 stats = self.backend.get_last_generation_stats() or {}
             self.generation_complete.emit(stats)
+            self.log.info("Generation complete.")
         except Exception as e:
+            self.log.error(f"Generation failed: {e}", exc_info=True)
             self.generation_error.emit(str(e))
 
 
@@ -106,6 +112,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # Setup logging first
+        setup_logging(log_level="DEBUG") # Set to DEBUG to capture everything
+        self.log = get_logger("app")
+
         self.config             = Config()
         self.backend            = None
         self.generation_thread  = None
@@ -118,8 +128,10 @@ class MainWindow(QMainWindow):
         self.prompt_manager     = SystemPromptManager()
         self.attached_files     = []  # List of file paths attached to next message
         self.internet_enabled   = bool(self.config.get("internet_enabled", False))
+        self.logs_dialog        = None
 
         self.init_ui()
+        self.log.info("UI Initialized.")
         self.load_configuration()
         self._refresh_history_list()
 
@@ -336,6 +348,11 @@ class MainWindow(QMainWindow):
         c.triggered.connect(self.clear_chat)
         edit_menu.addAction(c)
 
+        view_menu = menubar.addMenu("View")
+        l = QAction("Show Logs", self)
+        l.triggered.connect(self.show_logs)
+        view_menu.addAction(l)
+
         help_menu = menubar.addMenu("Help")
         a = QAction("About", self)
         a.triggered.connect(self.show_about)
@@ -543,8 +560,9 @@ class MainWindow(QMainWindow):
         if self.backend:
             try:
                 self.backend.cleanup()
+                self.log.info("Backend cleaned up successfully.")
             except Exception as e:
-                print(f"⚠️  Cleanup error: {e}")
+                self.log.error(f"Error during backend cleanup: {e}", exc_info=True)
         super().closeEvent(event)
     
 
@@ -706,6 +724,21 @@ class MainWindow(QMainWindow):
             )
         return ("unknown",)
 
+    def _populate_sensitive_strings(self):
+        """Populate the global list of strings to redact from logs."""
+        sensitive_keys = [
+            'llama_server_api_key',
+            'ollama_api_key',
+            'hf_api_key',
+            'openai_api_key',
+        ]
+        secrets = []
+        for key in sensitive_keys:
+            value = self.config.get(key, "")
+            if value and isinstance(value, str) and len(value) > 4:
+                secrets.append(value)
+        redact_module.SENSITIVE_STRINGS = list(set(secrets))
+
     def load_configuration(self):
         """Load configuration and initialize backend appropriately"""
         backend_type_str = self.config.get("backend_type", "local")
@@ -718,40 +751,43 @@ class MainWindow(QMainWindow):
             self.open_settings()
             return
 
+        # Populate the global list of secrets for log redaction
+        self._populate_sensitive_strings()
+
         # Create backend only if it doesn't exist or type changed
         backend_needs_update = False
         
         if self.backend is None:
             backend_needs_update = True
-            print("🔧 Creating new backend instance")
+            self.log.info("Creating new backend instance.")
         else:
             # Check if backend type changed
             current_type = getattr(self.backend, 'backend_type', None)
             target_type = {
                 "local": BackendType.LOCAL,
                 "llama_server": BackendType.LLAMA_SERVER,
-                "ollama": BackendType.OLLAMA, 
+                "ollama": BackendType.OLLAMA,
                 "huggingface": BackendType.HUGGINGFACE,
                 "openai_compatible": BackendType.OPENAI_COMPATIBLE,
             }.get(backend_type_str)
             
             if current_type != target_type:
                 backend_needs_update = True
-                print("🔧 Backend type changed, recreating")
+                self.log.info(f"Backend type changed from {current_type} to {target_type}, recreating.")
             elif self._backend_signature != target_signature:
                 backend_needs_update = True
-                print("🔧 Backend settings changed, recreating")
+                self.log.info("Backend settings changed, recreating.")
                 
         if backend_needs_update:
             try:
                 # Clean up old backend if it exists
                 if self.backend is not None:
                     self._stop_active_generation(reason="backend switch")
-                    print("🧹 Cleaning up old backend")
+                    self.log.info("Cleaning up old backend instance.")
                     try:
                         self.backend.cleanup()
                     except Exception as e:
-                        print(f"⚠️  Cleanup warning: {e}")
+                        self.log.warning(f"Warning during old backend cleanup: {e}")
                     self.backend = None
                     
                 if backend_type_str == "local":
@@ -813,11 +849,14 @@ class MainWindow(QMainWindow):
 
                 self._backend_signature = target_signature
                 self._set_initial_model_selection() # Call the new method here
+                if self.current_model:
+                    self.log.info(f"Initial model set to: {self._current_model_label()}")
 
             except Exception as e:
+                self.log.critical(f"Failed to initialize backend: {e}", exc_info=True)
                 QMessageBox.critical(self, "Error", f"Failed to initialize backend:\n{e}")
         else:
-            print("🔄 Reusing existing backend instance")
+            self.log.info("Reusing existing backend instance.")
             self._backend_signature = target_signature
             # Just refresh UI elements
             if backend_type_str == "local":
@@ -841,6 +880,8 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"✅ OpenAI-compatible backend: {openai_base_url}")
                 self.refresh_openai_compatible_model()
             self._set_initial_model_selection() # Call the new method here
+            if self.current_model:
+                self.log.info(f"Model re-confirmed: {self._current_model_label()}")
 
 
     def refresh_models(self):
@@ -1053,6 +1094,7 @@ class MainWindow(QMainWindow):
                     self.config.set("last_used_model", self.current_model.get("name") or self.current_model.get("request_model"))
                 else:
                     self.config.set("last_used_model", self.current_model)
+                self.log.info(f"Model changed to: {self._current_model_label()}")
                 # On local backend, restart + warmup when the model changes.
                 if (
                     self.current_model != previous_model
@@ -1371,7 +1413,7 @@ class MainWindow(QMainWindow):
         """Best-effort stop of any running generation thread and backend process."""
         if self.generation_thread and self.generation_thread.isRunning():
             label = f" ({reason})" if reason else ""
-            print(f"🛑 Stopping generation thread{label}...")
+            self.log.info(f"Stopping generation thread{label}...")
             if self.backend:
                 try:
                     self.backend.stop_generation()
@@ -1380,7 +1422,7 @@ class MainWindow(QMainWindow):
             self.generation_thread.quit()
             self.generation_thread.wait(3000)
             if self.generation_thread.isRunning():
-                print("⚠️  Generation thread did not stop; terminating")
+                self.log.warning("Generation thread did not stop gracefully; terminating.")
                 self.generation_thread.terminate()
                 self.generation_thread.wait(1000)
 
@@ -1423,6 +1465,16 @@ class MainWindow(QMainWindow):
             self._current_response = ""
             self.chat_display.clear()
             self.status_bar.showMessage("Chat cleared")
+
+    def show_logs(self):
+        """Create and show the logs dialog, parented to the main window."""
+        from ui.logs_dialog import LogsDialog
+        # Create a new instance if it doesn't exist or was closed
+        if self.logs_dialog is None or not self.logs_dialog.isVisible():
+            self.logs_dialog = LogsDialog(self) # Parent to main window
+        self.logs_dialog.show()
+        self.logs_dialog.raise_()
+        self.logs_dialog.activateWindow()
 
     def open_settings(self):
         from ui.settings_dialog import SettingsDialog

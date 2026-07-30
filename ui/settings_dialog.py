@@ -805,10 +805,35 @@ class SettingsDialog(QDialog):
         
         # Buttons
         button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        button_box.setStyleSheet("""
+
+        # Add a "Show Logs" button on the left side of the button box
+        self.show_logs_button = QPushButton("Show Logs")
+        self.show_logs_button.setToolTip("Open the application logs window")
+        # The parent of this dialog is the MainWindow, which has the show_logs method
+        if self.parent() and hasattr(self.parent(), "show_logs"):
+            self.show_logs_button.clicked.connect(self.parent().show_logs)
+
+        button_box.addButton(self.show_logs_button, QDialogButtonBox.ButtonRole.ActionRole)
+
+        # Custom styling for all buttons in the box
+        for btn in button_box.buttons():
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: #2C2C2E; color: #EBEBF5;
+                    border: 1px solid #3A3A3C; border-radius: 6px;
+                    padding: 6px 12px; font-size: 13px;
+                }
+                QPushButton:hover { 
+                    background: #3A3A3C; 
+                    border-color: #e009a7; 
+                }
+            """)
+
+        ok_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_button:
+            ok_button.setStyleSheet("""
             QPushButton {
                 background: #2C2C2E; color: #EBEBF5;
                 border: 1px solid #3A3A3C; border-radius: 6px;
@@ -819,6 +844,7 @@ class SettingsDialog(QDialog):
                 border-color: #e009a7; 
             }
         """)
+
         button_box.accepted.connect(self.save_and_accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)

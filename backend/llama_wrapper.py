@@ -16,6 +16,7 @@ import signal
 from pathlib import Path
 from typing import Optional, Callable, Generator
 from backend.process_utils import background_process_kwargs
+from backend.logger import get_logger
 
 
 class LlamaWrapper:
@@ -37,6 +38,7 @@ class LlamaWrapper:
         # Track instance creation
         LlamaWrapper._instance_count += 1
         self.instance_id = LlamaWrapper._instance_count
+        self.log = get_logger("backend.llama_wrapper")
         print(f"🔧 [LlamaWrapper #{self.instance_id}] Creating new instance")
 
         def _cfg_int(key: str, default: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
@@ -179,6 +181,7 @@ class LlamaWrapper:
         self.server_ready = False
         self.last_generation_stats = {}
         self.tool_protocol_supported = None  # None=unknown, True=supported, False=rejected
+        self._log_thread = None
         
         if not self.llama_cpp_path.exists():
             raise FileNotFoundError(f"llama-server not found at: {self.llama_cpp_path}")
@@ -327,27 +330,37 @@ class LlamaWrapper:
         # Build command for llama-server
         cmd = self._build_server_command(model_path)
         
-        print(f"🚀 [LlamaWrapper #{self.instance_id}] Starting server: {' '.join(cmd)}")
+        from backend.redact import redact_command, redact
+        self.log.info(f"Starting llama-server with command: {' '.join(shlex.quote(c) for c in redact_command(cmd))}")
         
         launch_env = self._build_server_env()
+        loggable_env = {k: v for k, v in launch_env.items() if k.startswith("GGML_") or k in self.extra_env}
+        if loggable_env:
+            self.log.info(f"Server environment variables: {redact(loggable_env)}")
+
         try:
-            print("launch_env:")
-            for k, v in launch_env.items():
-                if k.startswith("GGML_"):
-                    print(f"  {k}={v}")
             self.server_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=0,
+                bufsize=1,
                 universal_newlines=True,
                 env=launch_env,
                 cwd=str(self.llama_cpp_path.parent),
                 **background_process_kwargs(new_process_group=True),
             )
+
+            # Start threads to log stdout and stderr
+            self._log_thread = threading.Thread(
+                target=self._log_subprocess_output,
+                args=(self.server_process.stdout, self.server_process.stderr),
+                daemon=True
+            )
+            self._log_thread.start()
+
         except Exception as e:
-            print(f"❌ [LlamaWrapper #{self.instance_id}] Failed to start server: {e}")
+            self.log.error(f"Failed to start server: {e}", exc_info=True)
             self.server_process = None
             return False
         
@@ -378,6 +391,20 @@ class LlamaWrapper:
                 pass
             self._stop_server()
             return False
+
+    def _log_subprocess_output(self, stdout, stderr):
+        """Read and log output from a subprocess's streams."""
+        def log_stream(stream, level):
+            for line in iter(stream.readline, ''):
+                self.log.log(level, f"[llama-server] {line.strip()}")
+            stream.close()
+
+        stdout_thread = threading.Thread(target=log_stream, args=(stdout, 20)) # INFO
+        stderr_thread = threading.Thread(target=log_stream, args=(stderr, 40)) # ERROR
+        stdout_thread.start()
+        stderr_thread.start()
+        stdout_thread.join()
+        stderr_thread.join()
     
     def _is_port_free(self, port: int) -> bool:
         import socket
@@ -604,7 +631,7 @@ class LlamaWrapper:
     
     def _stop_server(self):
         """Stop the server process"""
-        if self.server_process:
+        if self.server_process and self.server_process.poll() is None:
             print(f"🛑 [LlamaWrapper #{self.instance_id}] Stopping server (PID: {self.server_process.pid})")
             try:
                 # Try graceful shutdown first

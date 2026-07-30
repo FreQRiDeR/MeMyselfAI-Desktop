@@ -4,6 +4,7 @@ Unified backend supporting local llama.cpp, remote llama-server, Ollama,
 HuggingFace, and OpenAI-compatible chat completion APIs.
 """
 
+import logging
 import sys
 import json
 import re
@@ -18,6 +19,8 @@ from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from backend.process_utils import background_process_kwargs
+from backend.redact import RedactingFilter
+from backend.logger import get_logger
 
 
 class BackendType(Enum):
@@ -54,6 +57,7 @@ class UnifiedBackend:
         self.last_generation_stats = {}
         self._active_response = None
         
+        self.log = get_logger("backend")
         # Initialize backend-specific components
         if backend_type == BackendType.LOCAL:
             from backend.llama_wrapper import LlamaWrapper
@@ -82,6 +86,20 @@ class UnifiedBackend:
                 raise ValueError("OpenAI-compatible base URL required")
             if not self.openai_model:
                 raise ValueError("OpenAI-compatible model required")
+        
+        # Configure network logging from urllib3 and redact sensitive info
+        urllib3_logger = get_logger("urllib3.connectionpool")
+        urllib3_logger.setLevel(logging.DEBUG) # Ensure DEBUG level for detailed logs
+        
+        # Add a filter to redact API keys from urllib3 logs
+        sensitive_keys = [
+            self.config.get('llama_server_api_key', ''),
+            self.config.get('ollama_api_key', ''),
+            self.config.get('hf_api_key', ''),
+            self.config.get('openai_api_key', ''),
+        ]
+        urllib3_logger.addFilter(RedactingFilter(sensitive_keys))
+        urllib3_logger.propagate = True # Allow logs to reach root handler and then QtLogHandler
 
     @staticmethod
     def _ollama_headers(api_key: str = "") -> dict:
@@ -827,6 +845,7 @@ class UnifiedBackend:
                 "error": "Empty query"
             }
 
+        self.log.info(f"Performing internet search for query: '{query}'")
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -1483,7 +1502,7 @@ class UnifiedBackend:
     
     def _start_ollama_if_needed(self):
         """Start Ollama serve process if using bundled Ollama"""
-        if self.ollama_path == 'bundled' or (hasattr(sys, '_MEIPASS') and not self.ollama_path):
+        if str(self.ollama_path).strip().lower() == 'bundled':
             # Don't spawn a new process if Ollama is already responding on the port
             if self.test_ollama_connection(self.ollama_url):
                 print("ℹ️  Ollama already running, skipping start")
@@ -1507,6 +1526,10 @@ class UnifiedBackend:
                             return
                     print("⚠️  Ollama started but not yet responding")
                 except Exception as e:
+                    if self.ollama_process and self.ollama_process.poll() is None:
+                        self.ollama_process.kill()
+                        self.ollama_process.wait()
+                    self.ollama_process = None
                     print(f"⚠️  Failed to start bundled Ollama: {e}")
     
     def _find_bundled_ollama(self):
@@ -2277,18 +2300,18 @@ class UnifiedBackend:
             self._active_response = None
 
         # Clean up bundled Ollama process
-        if self.ollama_process:
-            if self.ollama_process.poll() is None:  # still running
-                print("🛑 Stopping Ollama process...")
-                self.ollama_process.terminate()
-                try:
-                    self.ollama_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    print("⚠️  Ollama didn't terminate cleanly, killing...")
-                    self.ollama_process.kill()
-                    self.ollama_process.wait()
-                print("✅ Ollama stopped")
-            self.ollama_process = None
+        if self.ollama_process and self.ollama_process.poll() is None:
+            # This instance owns an Ollama process, so we should stop it.
+            print("🛑 Stopping Ollama process...")
+            self.ollama_process.terminate()
+            try:
+                self.ollama_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print("⚠️  Ollama didn't terminate cleanly, killing...")
+                self.ollama_process.kill()
+                self.ollama_process.wait()
+            print("✅ Ollama stopped")
+        self.ollama_process = None
 
     def preload_model(self, model_path: str) -> bool:
         """Preload/warm a local llama.cpp model server."""

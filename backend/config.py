@@ -176,7 +176,10 @@ class Config:
         elif backend_type == "llama_server":
             return bool(str(self.config.get("llama_server_url", "")).strip())
         elif backend_type == "ollama":
-            return self.get_ollama_path() is not None
+            # Configured if we have a path for a bundled server OR a URL for a remote one.
+            has_path = self.get_ollama_path() is not None
+            has_url = bool(str(self.config.get("ollama_url", "")).strip())
+            return has_path or has_url
         elif backend_type == "openai_compatible":
             return (
                 bool(str(self.config.get("openai_base_url", "")).strip())
