@@ -126,7 +126,9 @@ class UnifiedBackend:
     @classmethod
     def _openai_compatible_chat_url(cls, base_url: str) -> str:
         base = cls._openai_compatible_base_url(base_url)
-        if base.endswith('/v1'):
+        # If the base URL already contains a version segment (like /v1, /v1beta),
+        # append /chat/completions directly. Otherwise, assume the standard OpenAI /v1 prefix.
+        if re.search(r'/v\d+(beta)?$', base):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
 
@@ -1333,7 +1335,7 @@ class UnifiedBackend:
         for _ in range(max_rounds):
             try:
                 payload = {
-                    "model": self.openai_model,
+                    "model": request_model,
                     "messages": resolved_messages,
                     "stream": False,
                     "max_tokens": max_tokens,
@@ -1344,8 +1346,8 @@ class UnifiedBackend:
                 payload.update(self._openai_request_extras())
                 payload = self._deep_merge_dicts(payload, self._api_extra_body())
                 response = requests.post(
-                    self._openai_compatible_chat_url(self.openai_base_url),
-                    headers=self._openai_compatible_headers(self.openai_api_key),
+                    self._openai_compatible_chat_url(base_url),
+                    headers=self._openai_compatible_headers(api_key),
                     json=payload,
                     timeout=self.inference_timeout,
                 )
@@ -2003,12 +2005,22 @@ class UnifiedBackend:
             stream_usage = None
             web_results_used = 0
             web_sources = []
-            request_model = str(model or self.openai_model).strip() or self.openai_model
+
+            # Use model data from the selected combo item if it's a dict,
+            # otherwise fall back to the default config.
+            if isinstance(model, dict):
+                base_url = model.get("base_url", self.openai_base_url)
+                api_key = model.get("api_key", self.openai_api_key)
+                request_model = model.get("model", self.openai_model)
+            else:
+                base_url = self.openai_base_url
+                api_key = self.openai_api_key
+                request_model = str(model or self.openai_model).strip() or self.openai_model
 
             chat_messages = messages if messages else [{"role": "user", "content": prompt}]
             if internet_enabled:
                 chat_messages, web_results_used, web_sources = self._resolve_openai_compatible_internet_tools(
-                    chat_messages, max_tokens=max_tokens, temperature=temperature
+                    chat_messages, max_tokens=max_tokens, temperature=temperature, base_url=base_url, api_key=api_key, request_model=request_model
                 )
             chat_messages, web_results_used, web_sources = self._apply_forced_web_context_if_needed(
                 chat_messages,
@@ -2039,8 +2051,8 @@ class UnifiedBackend:
                 return
 
             response = requests.post(
-                self._openai_compatible_chat_url(self.openai_base_url),
-                headers=self._openai_compatible_headers(self.openai_api_key),
+                self._openai_compatible_chat_url(base_url),
+                headers=self._openai_compatible_headers(api_key),
                 json={
                     "model": request_model,
                     "messages": chat_messages,

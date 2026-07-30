@@ -21,7 +21,7 @@ class ModelManagerDialog(QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.manager = ModelManager()
+        self.manager = ModelManager(parent.config)
         self.init_ui()
         self.load_models()
     

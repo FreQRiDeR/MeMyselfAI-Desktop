@@ -127,6 +127,21 @@ class SettingsDialog(QDialog):
         
         paths_layout.addRow(self.llama_label, llama_layout)
 
+        # Models folder path (for local backend)
+        self.models_folder_label = QLabel("Models Folder:")
+        models_folder_layout = QHBoxLayout()
+        self.models_folder_path_input = QLineEdit()
+        self.models_folder_path_input.setPlaceholderText("Models (or /path/to/your/models)")
+        self.models_folder_path_input.setStyleSheet(self.llama_path_input.styleSheet())
+        models_folder_layout.addWidget(self.models_folder_path_input)
+
+        self.browse_models_folder_btn = QPushButton("Browse...")
+        self.browse_models_folder_btn.setStyleSheet(self.browse_llama_btn.styleSheet())
+        self.browse_models_folder_btn.clicked.connect(self.browse_models_path)
+        models_folder_layout.addWidget(self.browse_models_folder_btn)
+
+        paths_layout.addRow(self.models_folder_label, models_folder_layout)
+
         # Remote llama-server URL (for HTTP + SSE backend)
         self.llama_server_label = QLabel("Server URL:")
         self.llama_server_url_input = QLineEdit()
@@ -247,7 +262,51 @@ class SettingsDialog(QDialog):
         self.openai_model_input.setPlaceholderText("gpt-4o-mini")
         self.openai_model_input.setStyleSheet(self.hf_api_key_input.styleSheet())
         paths_layout.addRow(self.openai_model_label, self.openai_model_input)
+
+        # Separator
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        paths_layout.addRow(line)
+
+        # Save Custom Backend
+        self.openai_backend_name_label = QLabel("Save as:")
+        self.openai_backend_name_input = QLineEdit()
+        self.openai_backend_name_input.setPlaceholderText("My Custom Backend")
+        self.openai_backend_name_input.setStyleSheet(self.hf_api_key_input.styleSheet())
+        paths_layout.addRow(self.openai_backend_name_label, self.openai_backend_name_input)
+
+        self.save_openai_backend_button = QPushButton("Save")
+        self.save_openai_backend_button.setStyleSheet(self.browse_llama_btn.styleSheet())
+        self.save_openai_backend_button.clicked.connect(self.save_custom_backend)
+        paths_layout.addRow("", self.save_openai_backend_button)
         
+        # Separator
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.Shape.HLine)
+        line2.setFrameShadow(QFrame.Shadow.Sunken)
+        paths_layout.addRow(line2)
+
+        # Load/Delete Custom Backend
+        self.load_openai_backend_label = QLabel("Load / Delete:")
+        load_delete_layout = QHBoxLayout()
+        load_delete_layout.setContentsMargins(0,0,0,0)
+        load_delete_layout.setSpacing(6)
+
+        self.load_openai_backend_combo = QComboBox()
+        self.load_openai_backend_combo.setStyleSheet(self.backend_combo.styleSheet())
+        self.load_openai_backend_combo.addItem("Select a saved backend...")
+        self.load_openai_backend_combo.currentIndexChanged.connect(self.load_selected_backend)
+        load_delete_layout.addWidget(self.load_openai_backend_combo)
+
+        self.delete_openai_backend_button = QPushButton("🗑️ Delete")
+        self.delete_openai_backend_button.setStyleSheet(self.browse_llama_btn.styleSheet())
+        self.delete_openai_backend_button.setToolTip("Delete the backend selected in the dropdown")
+        self.delete_openai_backend_button.clicked.connect(self.delete_selected_backend)
+        load_delete_layout.addWidget(self.delete_openai_backend_button)
+
+        paths_layout.addRow(self.load_openai_backend_label, load_delete_layout)
+
         # Add note about models
         models_note = QLabel("💡 Models are managed via File → Manage Models")
         models_note.setStyleSheet("color: #666; font-style: italic;")
@@ -774,6 +833,7 @@ class SettingsDialog(QDialog):
 
         self.ollama_path_input.setText(self.config.get("ollama_path", ""))
         self.llama_path_input.setText(self.config.get("llama_cpp_path", ""))
+        self.models_folder_path_input.setText(self.config.get("models_folder", "Models"))
         self.llama_server_url_input.setText(self.config.get("llama_server_url", "http://localhost:8080"))
         self.llama_server_api_key_input.setText(self.config.get("llama_server_api_key", ""))
         self.ollama_url_input.setText(self.config.get("ollama_url", "http://localhost:11434"))
@@ -833,6 +893,16 @@ class SettingsDialog(QDialog):
         # Update visibility based on backend
         self.on_backend_changed()
     
+        # Populate custom backends dropdown
+        self.load_openai_backend_combo.blockSignals(True)
+        self.load_openai_backend_combo.clear()
+        self.load_openai_backend_combo.addItem("Select a saved backend to load...")
+        custom_backends = self.config.get("openai_compatible_backends", [])
+        # Sort by name for consistent ordering
+        custom_backends.sort(key=lambda b: (b.get("name") or "").lower())
+        for backend in custom_backends:
+            self.load_openai_backend_combo.addItem(backend.get("name"), backend)
+        self.load_openai_backend_combo.blockSignals(False)
     def on_backend_changed(self):
         """Handle backend type change - show/hide relevant fields"""
         backend = self.backend_combo.currentData()
@@ -846,6 +916,9 @@ class SettingsDialog(QDialog):
         self.llama_label.setVisible(is_local)
         self.llama_path_input.setVisible(is_local)
         self.browse_llama_btn.setVisible(is_local)
+        self.models_folder_label.setVisible(is_local)
+        self.models_folder_path_input.setVisible(is_local)
+        self.browse_models_folder_btn.setVisible(is_local)
         self.local_tuning_group.setVisible(is_local)
 
         # Show/hide remote llama-server fields
@@ -874,6 +947,13 @@ class SettingsDialog(QDialog):
         self.openai_api_key_input.setVisible(is_openai_compatible)
         self.openai_model_label.setVisible(is_openai_compatible)
         self.openai_model_input.setVisible(is_openai_compatible)
+        self.openai_backend_name_label.setVisible(is_openai_compatible)
+        self.openai_backend_name_input.setVisible(is_openai_compatible)
+        self.save_openai_backend_button.setVisible(is_openai_compatible)
+        self.load_openai_backend_label.setVisible(is_openai_compatible)
+        self.load_openai_backend_combo.setVisible(is_openai_compatible)
+        self.delete_openai_backend_button.setVisible(is_openai_compatible)
+
 
     def browse_ollama_path(self):
         """Browse for Ollama binary"""
@@ -898,6 +978,109 @@ class SettingsDialog(QDialog):
         
         if file_path:
             self.llama_path_input.setText(file_path)
+
+    def browse_models_path(self):
+        """Browse for Models folder"""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Models Folder",
+            ""
+        )
+        
+        if folder_path:
+            self.models_folder_path_input.setText(folder_path)
+
+    def save_custom_backend(self):
+        """Save the current OpenAI compatible settings as a named backend"""
+        name = self.openai_backend_name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Please enter a name for the custom backend.")
+            return
+
+        base_url = self.openai_base_url_input.text().strip()
+        api_key = self.openai_api_key_input.text().strip()
+        model = self.openai_model_input.text().strip()
+
+        if not base_url or not model:
+            QMessageBox.warning(self, "Missing Information", "Base URL and Model are required to save a backend.")
+            return
+
+        custom_backends = self.config.get("openai_compatible_backends", [])
+        
+        found_backend = None
+        for backend in custom_backends:
+            if backend.get("name") == name:
+                found_backend = backend
+                break
+
+        if found_backend:
+            reply = QMessageBox.question(
+                self, "Backend Exists", f'A backend named "{name}" already exists. Do you want to overwrite it?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+            found_backend["base_url"] = base_url
+            found_backend["api_key"] = api_key
+            found_backend["model"] = model
+        else:
+            custom_backends.append({
+                "name": name,
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+            })
+
+        self.config.set("openai_compatible_backends", custom_backends)
+        QMessageBox.information(self, "Success", f'Custom backend "{name}" has been saved.')
+        self.openai_backend_name_input.clear()
+        self.load_settings() # Reload to update the load combo
+
+    def load_selected_backend(self, index):
+        """Load the selected custom backend into the input fields"""
+        if index <= 0: # Ignore the placeholder item
+            return
+
+        backend_data = self.load_openai_backend_combo.itemData(index)
+        if not isinstance(backend_data, dict):
+            return
+
+        self.openai_base_url_input.setText(backend_data.get("base_url", ""))
+        self.openai_api_key_input.setText(backend_data.get("api_key", ""))
+        self.openai_model_input.setText(backend_data.get("model", ""))
+        self.openai_backend_name_input.setText(backend_data.get("name", ""))
+
+    def delete_selected_backend(self):
+        """Deletes the currently selected custom backend from the dropdown."""
+        index = self.load_openai_backend_combo.currentIndex()
+        if index <= 0:  # Ignore placeholder
+            QMessageBox.warning(self, "No Backend Selected", "Please select a backend from the dropdown to delete.")
+            return
+
+        backend_data = self.load_openai_backend_combo.itemData(index)
+        if not isinstance(backend_data, dict):
+            return
+
+        name = backend_data.get("name")
+        reply = QMessageBox.question(
+            self, "Delete Backend", f'Are you sure you want to delete the custom backend "{name}"?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.No:
+            return
+
+        custom_backends = self.config.get("openai_compatible_backends", [])
+        updated_backends = [b for b in custom_backends if b.get("name") != name]
+
+        if len(updated_backends) < len(custom_backends):
+            self.config.set("openai_compatible_backends", updated_backends)
+            QMessageBox.information(self, "Success", f'Custom backend "{name}" has been deleted.')
+            
+            # Clear input fields if the deleted backend was loaded
+            if self.openai_backend_name_input.text() == name:
+                self.openai_backend_name_input.clear()
+
+            self.load_settings()  # Reload to update the dropdown
     
     def validate_settings(self) -> bool:
         """Validate settings before saving"""
@@ -1067,6 +1250,7 @@ class SettingsDialog(QDialog):
         # Save all settings
         self.config.set("backend_type", self.backend_combo.currentData())
         self.config.set("llama_cpp_path", self.llama_path_input.text().strip())
+        self.config.set("models_folder", self.models_folder_path_input.text().strip())
         self.config.set("llama_server_url", self.llama_server_url_input.text().strip())
         self.config.set("llama_server_api_key", self.llama_server_api_key_input.text().strip())
         self.config.set("ollama_url", self.ollama_url_input.text().strip())

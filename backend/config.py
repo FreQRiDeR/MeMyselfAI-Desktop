@@ -41,6 +41,8 @@ class Config:
         "openai_base_url": "https://api.openai.com/v1",
         "openai_api_key": "",
         "openai_model": "gpt-3.5-turbo",
+        "models_folder": "Models",
+        "last_used_model": "",
         "default_model": "",
         "max_tokens": 512,
         "temperature": 0.7,

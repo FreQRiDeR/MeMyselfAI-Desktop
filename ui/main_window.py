@@ -812,6 +812,7 @@ class MainWindow(QMainWindow):
                     self.refresh_openai_compatible_model()
 
                 self._backend_signature = target_signature
+                self._set_initial_model_selection() # Call the new method here
 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to initialize backend:\n{e}")
@@ -839,23 +840,27 @@ class MainWindow(QMainWindow):
                 openai_base_url = self.config.get("openai_base_url", "https://api.openai.com/v1")
                 self.status_bar.showMessage(f"✅ OpenAI-compatible backend: {openai_base_url}")
                 self.refresh_openai_compatible_model()
+            self._set_initial_model_selection() # Call the new method here
 
 
     def refresh_models(self):
         from backend.model_manager import ModelManager
-        manager = ModelManager()
+        self.model_combo.blockSignals(True)
+        manager = ModelManager(self.config)
         models = manager.get_all_models()
         self.model_combo.clear()
         if not models:
             self.model_combo.addItem("No models – use File → Manage Models to add")
             self.status_bar.showMessage("⚠️  No models configured")
-            return
-        for m in models:
-            self.model_combo.addItem(f"{m.name} ({m.size_mb}MB)", m.path)
-        self.status_bar.showMessage(f"Found {len(models)} model(s)")
+        else:
+            for m in models:
+                self.model_combo.addItem(f"{m.name} ({m.size_mb}MB)", m.path)
+            self.status_bar.showMessage(f"Found {len(models)} model(s)")
+        self.model_combo.blockSignals(False)
 
     def refresh_llama_server_models(self):
         from backend.unified_backend import UnifiedBackend
+        self.model_combo.blockSignals(True)
 
         llama_server_url = self.config.get("llama_server_url", "http://localhost:8080")
         llama_server_api_key = self.config.get("llama_server_api_key", "")
@@ -868,8 +873,8 @@ class MainWindow(QMainWindow):
 
         self.model_combo.clear()
         self.model_combo.addItem(f"🌐 {endpoint_label}", model_data)
-        self.model_combo.setCurrentIndex(0)
-        self.current_model = model_data
+
+        self.model_combo.blockSignals(False)
 
         if UnifiedBackend.test_llama_server_connection(llama_server_url, llama_server_api_key):
             self.status_bar.showMessage(f"Connected to remote llama-server: {endpoint_label}")
@@ -878,26 +883,57 @@ class MainWindow(QMainWindow):
 
     def refresh_openai_compatible_model(self):
         from backend.unified_backend import UnifiedBackend
+        self.model_combo.blockSignals(True)
 
         base_url = self.config.get("openai_base_url", "https://api.openai.com/v1")
         api_key = self.config.get("openai_api_key", "")
         model_name = self.config.get("openai_model", "gpt-3.5-turbo")
-        parsed = urlparse(base_url)
-        endpoint_label = parsed.netloc or parsed.path or base_url
 
         self.model_combo.clear()
-        self.model_combo.addItem(f"{model_name} ({endpoint_label})", model_name)
-        self.model_combo.setCurrentIndex(0)
-        self.current_model = model_name
 
-        if UnifiedBackend.test_openai_compatible_connection(base_url, api_key):
-            self.status_bar.showMessage(f"Connected to OpenAI-compatible provider: {endpoint_label}")
+        # Add the default model from settings
+        if model_name:
+            parsed = urlparse(base_url)
+            endpoint_label = parsed.netloc or parsed.path or base_url
+            default_model_data = {
+                "name": "Default",
+                "display_name": f"{model_name} ({endpoint_label})",
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model_name,
+            }
+            self.model_combo.addItem(f"⚙️ {default_model_data['display_name']}", default_model_data)
+
+        # Add custom saved backends
+        custom_backends = self.config.get("openai_compatible_backends", [])
+        for backend in custom_backends:
+            if isinstance(backend, dict) and backend.get("name"):
+                display_name = f"{backend['model']} ({backend['name']})"
+                backend_data = {
+                    "name": backend["name"],
+                    "display_name": display_name,
+                    "base_url": backend["base_url"],
+                    "api_key": backend["api_key"],
+                    "model": backend["model"],
+                }
+                self.model_combo.addItem(f"👤 {display_name}", backend_data)
+
+        self.model_combo.blockSignals(False)
+
+        if self.model_combo.count() > 0:
+            # Test connection of the currently selected model
+            current_data = self.model_combo.currentData()
+            if UnifiedBackend.test_openai_compatible_connection(current_data['base_url'], current_data['api_key']):
+                self.status_bar.showMessage(f"Connected to {current_data['name']}")
+            else:
+                self.status_bar.showMessage(f"⚠️ Provider not reachable: {current_data['name']}")
         else:
-            self.status_bar.showMessage(f"⚠️  OpenAI-compatible provider not reachable: {endpoint_label}")
+            self.status_bar.showMessage("⚠️ No OpenAI-compatible models configured.")
 
     def refresh_ollama_models(self):
         from backend.unified_backend import UnifiedBackend
         import requests
+        self.model_combo.blockSignals(True)
         ollama_url = self.config.get("ollama_url", "http://localhost:11434")
         ollama_api_key = self.config.get("ollama_api_key", "")
         local_models = []
@@ -958,14 +994,49 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("⚠️  No local models. Add an Ollama API key for cloud models.")
             else:
                 self.status_bar.showMessage("⚠️  No Ollama models available")
-            return
+        else:
+            for entry in all_models:
+                self.model_combo.addItem(entry["label"], entry["data"])
 
-        for entry in all_models:
-            self.model_combo.addItem(entry["label"], entry["data"])
+            self.status_bar.showMessage(
+                f"Found {len(all_models)} Ollama model(s) – {len(cloud_models)} cloud, {len(local_models)} local"
+            )
+        self.model_combo.blockSignals(False)
 
-        self.status_bar.showMessage(
-            f"Found {len(all_models)} Ollama model(s) – {len(cloud_models)} cloud, {len(local_models)} local"
-        )
+    def _set_initial_model_selection(self):
+        """Set the model_combo to the last used model, or the first available if not found."""
+        last_model = self.config.get("last_used_model")
+        if last_model:
+            index = -1
+            # For local models, last_model is the path, for others it's model_data or model_name
+            for i in range(self.model_combo.count()):
+                item_data = self.model_combo.itemData(i)
+                if item_data == last_model:
+                    index = i
+                    break
+                # Special handling for dict-based model_data (ollama, llama_server)
+                if isinstance(item_data, dict) and item_data.get("request_model") == last_model:
+                    index = i
+                    break
+                # Special handling for OpenAI compatible backends by name
+                if isinstance(item_data, dict) and item_data.get("name") == last_model:
+                    index = i
+                    break
+                if isinstance(item_data, dict) and item_data.get("display_name") == last_model:
+                    index = i
+                    break
+            
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+                self.current_model = self.model_combo.itemData(index) # Ensure current_model is set
+                return
+
+        # If no last_model or not found, select the first valid item
+        if self.model_combo.count() > 0:
+            self.model_combo.setCurrentIndex(0)
+            self.current_model = self.model_combo.itemData(0)
+        else:
+            self.current_model = None # No models available
 
     def _current_model_label(self) -> str:
         if isinstance(self.current_model, dict):
@@ -977,6 +1048,11 @@ class MainWindow(QMainWindow):
             previous_model = self.current_model
             self.current_model = self.model_combo.itemData(index)
             if self.current_model:
+                # For dict-based models, save a unique identifier
+                if isinstance(self.current_model, dict):
+                    self.config.set("last_used_model", self.current_model.get("name") or self.current_model.get("request_model"))
+                else:
+                    self.config.set("last_used_model", self.current_model)
                 # On local backend, restart + warmup when the model changes.
                 if (
                     self.current_model != previous_model
@@ -1184,7 +1260,7 @@ class MainWindow(QMainWindow):
         messages.append(user_message)
 
         self.generation_thread = GenerationThread(
-            self.backend, self.current_model, full_prompt,
+            self.backend, self.current_model, full_prompt, # Pass the full model dict
             self.config.get("max_tokens", 512),
             self.config.get("temperature", 0.7),
             system_prompt_text,

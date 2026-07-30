@@ -45,10 +45,11 @@ def get_config_dir():
 class ModelManager:
     """Manages model references stored in JSON"""
     
-    def __init__(self, config_file: str = "models.json"):
+    def __init__(self, config, config_file: str = "models.json"):
         config_dir = get_config_dir()
         self.config_file = config_dir / config_file
         self.models: List[ModelReference] = []
+        self.config = config
         self.load()
     
     def load(self):
@@ -75,7 +76,27 @@ class ModelManager:
             print(f"✅ [ModelManager] Saved {len(self.models)} model(s)")
         except Exception as e:
             print(f"❌ [ModelManager] Failed to save: {e}")
-    
+
+    def sync_models_from_folder(self, folder_path: str):
+        """Sync models.json with a folder."""
+        model_folder = Path(folder_path)
+        if not model_folder.is_dir():
+            return
+
+        # Find all .gguf files in the folder
+        found_files = {str(p.absolute()) for p in model_folder.glob("*.gguf")}
+        
+        # Models currently in models.json
+        known_files = {m.path for m in self.models}
+        
+        # Add new models
+        for file_path in found_files - known_files:
+            self.add_model(file_path)
+            
+        # Remove old models
+        for file_path in known_files - found_files:
+            self.remove_model(file_path)
+
     def add_model(self, path: str, custom_name: Optional[str] = None) -> bool:
         """
         Add a model reference
@@ -144,6 +165,10 @@ class ModelManager:
     
     def get_all_models(self) -> List[ModelReference]:
         """Get all model references"""
+        # Sync with the models folder first
+        models_folder = self.config.get("models_folder", "Models")
+        self.sync_models_from_folder(models_folder)
+
         # Filter out models whose files no longer exist
         valid_models = []
         for model in self.models:
