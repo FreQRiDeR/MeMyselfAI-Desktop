@@ -10,7 +10,9 @@ import json
 import re
 import requests
 import subprocess
+import threading
 import time
+import shlex
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from enum import Enum
@@ -71,8 +73,8 @@ class UnifiedBackend:
             self.ollama_url = config.get('ollama_url', 'http://localhost:11434')
             self.ollama_path = config.get('ollama_path', 'bundled')
             self.ollama_api_key = str(config.get('ollama_api_key', '')).strip()
+            self.ollama_log_thread = None
             self.ollama_cloud_url = config.get('ollama_cloud_url', self.OLLAMA_CLOUD_URL)
-            self._start_ollama_if_needed()
         elif backend_type == BackendType.HUGGINGFACE:
             self.hf_api_key = config.get('api_key')
             if not self.hf_api_key:
@@ -194,7 +196,7 @@ class UnifiedBackend:
             )
 
         base_url = self.ollama_cloud_url if route == 'cloud' else self.ollama_url
-        headers = self._ollama_headers(self.ollama_api_key if route == 'cloud' else '')
+        headers = self._ollama_headers(self.ollama_api_key)
 
         return {
             'route': route,
@@ -1512,12 +1514,37 @@ class UnifiedBackend:
             if ollama_binary:
                 try:
                     print(f"🚀 Starting bundled Ollama: {ollama_binary}")
+                    
+                    cmd = [str(ollama_binary), 'serve']
+                    use_shell = sys.platform != "win32"
+                    
+                    if use_shell and hasattr(shlex, 'join'):
+                        final_cmd = shlex.join(['exec'] + cmd)
+                    elif use_shell:
+                        final_cmd = 'exec ' + ' '.join(shlex.quote(c) for c in cmd)
+                    else:
+                        final_cmd = cmd
+
                     self.ollama_process = subprocess.Popen(
-                        [str(ollama_binary), 'serve'],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        **background_process_kwargs(),
+                        final_cmd,
+                        shell=use_shell,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True,
+                        **background_process_kwargs(new_process_group=True),
                     )
+
+                    # Start a thread to log the output, which also keeps it visible
+                    # in system monitors like Activity Monitor.
+                    self.ollama_log_thread = threading.Thread(
+                        target=self._log_subprocess_output,
+                        args=(self.ollama_process.stdout, self.ollama_process.stderr),
+                        daemon=True
+                    )
+                    self.ollama_log_thread.start()
+
                     # Wait up to 10s for Ollama to be ready instead of blind sleep
                     for _ in range(20):
                         time.sleep(0.5)
@@ -1531,6 +1558,20 @@ class UnifiedBackend:
                         self.ollama_process.wait()
                     self.ollama_process = None
                     print(f"⚠️  Failed to start bundled Ollama: {e}")
+
+    def _log_subprocess_output(self, stdout, stderr):
+        """Read and log output from a subprocess's streams."""
+        def log_stream(stream, level):
+            for line in iter(stream.readline, ''):
+                self.log.log(level, f"[ollama-server] {line.strip()}")
+            stream.close()
+
+        stdout_thread = threading.Thread(target=log_stream, args=(stdout, 20)) # INFO
+        stderr_thread = threading.Thread(target=log_stream, args=(stderr, 40)) # ERROR
+        stdout_thread.start()
+        stderr_thread.start()
+        stdout_thread.join()
+        stderr_thread.join()
     
     def _find_bundled_ollama(self):
         """Find bundled Ollama binary"""

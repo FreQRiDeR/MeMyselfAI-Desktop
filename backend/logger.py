@@ -13,20 +13,29 @@ class QtLogHandler(logging.Handler, QObject):
     """
     A logging handler that emits a Qt signal for each log record.
     This allows the UI to display logs in real-time.
+    It also caches records until the UI is ready to consume them.
     """
     new_log_record = pyqtSignal(logging.LogRecord)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         QObject.__init__(self)
+        self.record_cache = []
 
     def emit(self, record):
-        """Emit the log record via a Qt signal."""
+        """Emit the log record via a Qt signal and cache it."""
         # Create a copy to avoid modifying the original record
         redacted_record = logging.makeLogRecord(record.__dict__)
         redacted_record.msg = redact(redacted_record.msg)
-        redacted_record.args = tuple(redact(arg) for arg in redacted_record.args)
+        if isinstance(redacted_record.args, (list, tuple)):
+            redacted_record.args = tuple(redact(arg) for arg in redacted_record.args)
+
+        self.record_cache.append(redacted_record)
         self.new_log_record.emit(redacted_record)
+
+    def get_cache(self):
+        """Return all cached records."""
+        return list(self.record_cache)
 
 
 # Global instance of the handler

@@ -6,10 +6,10 @@ Main application window with chat history side pane
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextBrowser, QLineEdit, QPushButton, QComboBox,
-    QLabel, QMessageBox, QStatusBar, QListWidget,
+    QLabel, QMessageBox, QStatusBar, QListWidget, QApplication,
     QListWidgetItem, QFrame, QFileDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QPropertyAnimation, QEasingCurve, QTimer
 from PyQt6.QtGui import QAction, QColor, QFont, QTextCharFormat, QTextCursor, QPixmap, QKeySequence, QShortcut
 import sys
 import base64
@@ -26,7 +26,7 @@ from backend.config import Config
 from backend.chat_history import ChatHistory, Conversation
 from backend.system_prompts import SystemPromptManager
 from backend import redact as redact_module
-from backend.logger import setup_logging, get_logger
+from backend.logger import get_logger
 
 
 # ─────────────────────────────────────────────
@@ -112,8 +112,6 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        # Setup logging first
-        setup_logging(log_level="DEBUG") # Set to DEBUG to capture everything
         self.log = get_logger("app")
 
         self.config             = Config()
@@ -134,6 +132,8 @@ class MainWindow(QMainWindow):
         self.log.info("UI Initialized.")
         self.load_configuration()
         self._refresh_history_list()
+        # Use a single shot QTimer to ensure this runs after the event loop starts
+        QTimer.singleShot(0, self.on_app_fully_loaded)
 
     # ─── UI construction ──────────────────────
     def init_ui(self):
@@ -652,6 +652,20 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Font size: {new_size} pt")
 
     # ─── Configuration ────────────────────────
+    def on_app_fully_loaded(self):
+        """Called after the main window is shown and the event loop is running."""
+        self.log.info("Application is fully loaded. Performing post-load checks.")
+        backend_type_str = self.config.get("backend_type", "local")
+        if backend_type_str == "ollama" and self.backend and self.current_model:
+            # Only start the bundled server if a local model is selected.
+            # Cloud models do not require the local 'ollama serve' process.
+            is_cloud_model = False
+            if isinstance(self.current_model, dict):
+                is_cloud_model = self.current_model.get("route") == "cloud"
+
+            if not is_cloud_model:
+                self.backend._start_ollama_if_needed()
+
     def _local_backend_kwargs(self, llama_path):
         return {
             "llama_cpp_path": llama_path,

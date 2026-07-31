@@ -33,7 +33,7 @@ class LlamaWrapper:
             llama_cpp_path: Path to llama-server binary (or 'bundled' to use bundled version)
             tuning: Optional local backend tuning settings from config
         """
-        tuning = tuning or {}
+        self.tuning = tuning or {}
 
         # Track instance creation
         LlamaWrapper._instance_count += 1
@@ -43,7 +43,7 @@ class LlamaWrapper:
 
         def _cfg_int(key: str, default: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
             try:
-                value = int(tuning.get(key, default))
+                value = int(self.tuning.get(key, default))
             except (TypeError, ValueError):
                 value = default
             if min_value is not None:
@@ -57,14 +57,14 @@ class LlamaWrapper:
         self.batch_size = _cfg_int("llama_batch_size", 2048, min_value=1)
         self.ubatch_size = _cfg_int("llama_ubatch_size", 512, min_value=1)
         self.threads_batch = _cfg_int("llama_threads_batch", 0, min_value=0)
-        self.flash_attn = str(tuning.get("llama_flash_attn", "auto")).lower()
-        self.kv_offload = bool(tuning.get("llama_kv_offload", True))
-        self.use_mmap = bool(tuning.get("llama_mmap", True))
-        self.use_mlock = bool(tuning.get("llama_mlock", False))
-        self.numa_mode = str(tuning.get("llama_numa", "disabled")).lower()
+        self.flash_attn = str(self.tuning.get("llama_flash_attn", "auto")).lower()
+        self.kv_offload = bool(self.tuning.get("llama_kv_offload", True))
+        self.use_mmap = bool(self.tuning.get("llama_mmap", True))
+        self.use_mlock = bool(self.tuning.get("llama_mlock", False))
+        self.numa_mode = str(self.tuning.get("llama_numa", "disabled")).lower()
         self.priority = _cfg_int("llama_priority", 0, min_value=-1, max_value=3)
         self.poll = _cfg_int("llama_poll", 50, min_value=0, max_value=100)
-        self.extra_args = str(tuning.get("llama_extra_args", "")).strip()
+        self.extra_args = str(self.tuning.get("llama_extra_args", "")).strip()
         self.request_timeout = _cfg_int("inference_timeout", 300, min_value=30, max_value=3600)
 
         # Split user-supplied extra args into environment variables (KEY=VALUE)
@@ -81,7 +81,7 @@ class LlamaWrapper:
         if self.numa_mode not in {"disabled", "distribute", "isolate", "numactl"}:
             self.numa_mode = "disabled"
 
-        raw_gpu_layers = str(tuning.get("llama_gpu_layers", "auto")).strip().lower()
+        raw_gpu_layers = str(self.tuning.get("llama_gpu_layers", "auto")).strip().lower()
         if raw_gpu_layers in {"auto", "all"}:
             self.gpu_layers = raw_gpu_layers
         else:
@@ -252,6 +252,13 @@ class LlamaWrapper:
         if self.numa_mode in {"distribute", "isolate", "numactl"}:
             cmd.extend(['--numa', self.numa_mode])
 
+        # If a llama_server_api_key is provided and not empty, add it to the command.
+        # This prevents llama-server from logging warnings about an unset API key
+        # when a local connection does not require one.
+        api_key = str(self.tuning.get("llama_server_api_key", "")).strip()
+        if api_key:
+            cmd.extend(['--api-key', api_key])
+
         # Keep port/host arguments last and controlled by wrapper.
         # Note: env vars (KEY=VALUE) were already separated out in __init__
         # via _parse_extra_args; only command-line flags are appended here.
@@ -339,8 +346,25 @@ class LlamaWrapper:
             self.log.info(f"Server environment variables: {redact(loggable_env)}")
 
         try:
+            # For macOS and Linux, use `exec` to replace the shell process. This makes
+            # the server appear as its own process in Activity Monitor instead of
+            # being a child of the Python script, which is cleaner for monitoring.
+            # On Windows, `exec` is not a command, so we stick to the default.
+            use_shell = sys.platform != "win32"
+            
+            # `shlex.join` is available in Python 3.8+ and is the safest way to
+            # construct a shell command string.
+            if use_shell and hasattr(shlex, 'join'):
+                final_cmd = shlex.join(['exec'] + cmd)
+            elif use_shell:
+                # Manual quoting for older Python versions (less robust)
+                final_cmd = 'exec ' + ' '.join(shlex.quote(c) for c in cmd)
+            else:
+                final_cmd = cmd
+
             self.server_process = subprocess.Popen(
-                cmd,
+                final_cmd,
+                shell=use_shell,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

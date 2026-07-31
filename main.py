@@ -16,6 +16,7 @@ from PyQt6.QtGui import QIcon
 sys.path.insert(0, str(Path(__file__).parent))
 
 from ui.main_window import MainWindow
+from backend.logger import setup_logging
 
 
 def _resource_path(name: str) -> Path:
@@ -57,6 +58,9 @@ def main():
     app.setApplicationName("MeMyselfAI")
     app.setOrganizationName("MeMyselfAI")
     app.setStyle("Fusion")  # Ensures stylesheet arrow/button subcontrols render correctly on macOS
+    
+    # Setup logging first
+    setup_logging(log_level="DEBUG") # Set to DEBUG to capture everything
 
     app_icon = _load_app_icon()
     if app_icon is not None:
